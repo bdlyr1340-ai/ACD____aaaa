@@ -1,14 +1,15 @@
-"""Google Account Rotator — change password & 2FA for a Google account.
+"""Google Account Rotator — Camoufox edition.
 
 Public entry point:
     rotate_google_account(on_progress, gmail, old_password, old_totp_secret, user_id)
 
-Returns dict with: success, gmail, new_password, new_totp_secret,
-                   step, error, screenshot_path, html_path.
-
-Designed to be resilient: any exception is caught, a screenshot is taken,
-and the failing step name is reported so the caller can forward it to the
-user / admin.
+This rewrite restores the techniques from the original (working) version:
+- Camoufox first, Patchright second, Playwright Chromium last.
+- Heavy stealth JS + realistic UA rotation.
+- "Warmup" visit to google.com before sign-in (builds cookies, looks human).
+- Random mouse movements + per-character typing delay.
+- Robust password-field detection that ignores Google's hidden trap fields.
+- Detects "Couldn't sign you in" and retries with a fresh page.
 """
 from __future__ import annotations
 
@@ -20,8 +21,8 @@ import re
 import secrets
 import string
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pyotp
 
@@ -29,7 +30,10 @@ log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
-# Ordered list of steps used for progress display
+# ---------------------------------------------------------------------------
+# Steps & labels (unchanged public contract)
+# ---------------------------------------------------------------------------
+
 ROTATION_STEPS: List[str] = [
     "launch_browser",
     "google_login_email",
@@ -44,28 +48,53 @@ ROTATION_STEPS: List[str] = [
 ]
 
 STEP_LABELS_AR: Dict[str, str] = {
-    "launch_browser":          "تشغيل المتصفح",
-    "google_login_email":      "إدخال البريد الإلكتروني",
-    "google_login_password":   "إدخال كلمة السر",
-    "google_login_2fa":        "المصادقة الثنائية",
-    "open_security_page":      "فتح إعدادات الأمان",
-    "change_password":         "تغيير كلمة السر",
-    "open_2fa_settings":       "فتح إعدادات 2FA",
+    "launch_browser":           "تشغيل المتصفح",
+    "google_login_email":       "إدخال البريد الإلكتروني",
+    "google_login_password":    "إدخال كلمة السر",
+    "google_login_2fa":         "المصادقة الثنائية",
+    "open_security_page":       "فتح إعدادات الأمان",
+    "change_password":          "تغيير كلمة السر",
+    "open_2fa_settings":        "فتح إعدادات 2FA",
     "enable_new_authenticator": "إضافة Authenticator جديد",
-    "verify_new_2fa":          "تأكيد المصادقة الجديدة",
-    "done":                    "مكتمل",
+    "verify_new_2fa":           "تأكيد المصادقة الجديدة",
+    "done":                     "مكتمل",
 }
 
 SHOTS_DIR = os.environ.get("SHOTS_DIR", "/tmp/shots")
 os.makedirs(SHOTS_DIR, exist_ok=True)
 
+# Speed factor (lower = faster). Override via env var.
+_SPEED = float(os.getenv("SHEERID_SPEED_FACTOR", "0.35"))
+
+# Stealth UA pool (rotated per run)
+_STEALTH_UAS = [
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/136.0.7103.93 Safari/537.36"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/136.0.7103.93 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/135.0.7049.115 Safari/537.36"),
+]
+
+_EXTRA_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+const _origQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (_origQuery) {
+    window.navigator.permissions.query = (p) =>
+        p.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : _origQuery(p);
+}
+"""
+
 
 # ---------------------------------------------------------------------------
-# Helpers: password & secret generation
+# Helpers — passwords / TOTP
 # ---------------------------------------------------------------------------
 
 def _generate_strong_password(length: int = 16) -> str:
-    """Generate a strong password meeting Google's requirements."""
     if length < 12:
         length = 12
     upper = string.ascii_uppercase
@@ -79,17 +108,12 @@ def _generate_strong_password(length: int = 16) -> str:
     return "".join(pwd)
 
 
-def _generate_totp_secret() -> str:
-    """Generate a fresh 32-char base32 TOTP secret."""
-    return pyotp.random_base32(length=32)
-
-
 def _now_totp(secret: str) -> str:
     return pyotp.TOTP(secret.replace(" ", "").upper()).now()
 
 
 # ---------------------------------------------------------------------------
-# Helpers: screenshots / html dumps
+# Helpers — screenshots / delays / human-ness
 # ---------------------------------------------------------------------------
 
 async def _capture(page, user_id: int, tag: str) -> Dict[str, Optional[str]]:
@@ -113,15 +137,23 @@ async def _capture(page, user_id: int, tag: str) -> Dict[str, Optional[str]]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Helpers: human-like delays
-# ---------------------------------------------------------------------------
-
 async def _hd(min_s: float = 0.4, max_s: float = 1.4) -> None:
-    await asyncio.sleep(random.uniform(min_s, max_s))
+    await asyncio.sleep(random.uniform(min_s * _SPEED, max_s * _SPEED))
 
 
-async def _type_human(page, selector: str, text: str) -> None:
+async def _human_mouse_move(page) -> None:
+    try:
+        for _ in range(random.randint(2, 5)):
+            x = random.randint(100, 900)
+            y = random.randint(100, 600)
+            await page.mouse.move(x, y, steps=random.randint(5, 15))
+            await asyncio.sleep(random.uniform(0.05, 0.2))
+    except Exception:
+        pass
+
+
+async def _type_human_at(page, selector: str, text: str) -> None:
+    """Click a selector then type each char with a small random delay."""
     await page.click(selector)
     await _hd(0.2, 0.5)
     for ch in text:
@@ -130,12 +162,8 @@ async def _type_human(page, selector: str, text: str) -> None:
 
 
 async def _wait_for_visible_locator(page, selectors: List[str], timeout_ms: int = 20_000):
-    """Return the first *truly visible* locator from a list of selectors.
-
-    FIX: نتجاهل الحقول المخفية التي ترسلها Google كفخّ
-    (hiddenPassword / aria-hidden / tabindex=-1) ونتحقق من كل المطابقات
-    وليس فقط `.first` لأن الحقل الحقيقي قد لا يكون أول واحد في DOM.
-    """
+    """Return the first truly-visible locator, ignoring Google's hidden traps
+    (hiddenPassword / aria-hidden=true / tabindex=-1)."""
     deadline = time.time() + (timeout_ms / 1000.0)
     last_error = None
     while time.time() < deadline:
@@ -145,7 +173,6 @@ async def _wait_for_visible_locator(page, selectors: List[str], timeout_ms: int 
                 n = await loc_all.count()
                 for i in range(n):
                     cand = loc_all.nth(i)
-                    # تخطّى أي حقل وسمه Google كفخّ
                     try:
                         name = (await cand.get_attribute("name")) or ""
                         aria = (await cand.get_attribute("aria-hidden")) or ""
@@ -168,17 +195,11 @@ async def _wait_for_visible_locator(page, selectors: List[str], timeout_ms: int 
     raise RuntimeError(f"Timed out waiting for visible element: {joined}")
 
 
-# ---------------------------------------------------------------------------
-# Helpers: click by visible text
-# ---------------------------------------------------------------------------
-
 async def _click_text(page, substrings: List[str], timeout_ms: int = 4000) -> bool:
-    """Click the first visible element containing any of the given substrings."""
     end = time.time() + timeout_ms / 1000.0
     while time.time() < end:
         for substr in substrings:
             try:
-                # Match button / div / span / a containing the text (case-insensitive)
                 loc = page.locator(
                     f"xpath=//*[self::button or self::div or self::span or self::a or @role='button']"
                     f"[contains(translate(normalize-space(.),"
@@ -194,24 +215,17 @@ async def _click_text(page, substrings: List[str], timeout_ms: int = 4000) -> bo
     return False
 
 
-# ---------------------------------------------------------------------------
-# Helpers: switch challenge from Device-tap to TOTP
-# ---------------------------------------------------------------------------
-
 async def _switch_to_totp_method(page) -> bool:
-    """When Google asks for a phone tap, click 'Try another way' → 'Google Authenticator'."""
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
         body = ""
-
     needs_switch = any(kw in body for kw in [
         "tap yes", "check your", "device-tap", "open the gmail app",
         "tap your", "اضغط نعم", "فتح تطبيق",
     ])
     if not needs_switch:
         return False
-
     if not await _click_text(page, ["try another way", "طريقة أخرى", "جرب طريقة"], 4000):
         return False
     await _hd(0.8, 1.6)
@@ -225,92 +239,255 @@ async def _switch_to_totp_method(page) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Browser launch
+# Warmup — visit google.com first to look human and gather cookies
 # ---------------------------------------------------------------------------
 
-async def _launch_browser(pw):
-    """Launch a stealthy Chromium with optional proxy."""
-    proxy_url = os.environ.get("PROXY_URL", "").strip()
-    proxy_cfg = None
-    if proxy_url:
-        u = urlparse(proxy_url)
-        proxy_cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
-        if u.username:
-            proxy_cfg["username"] = u.username
-        if u.password:
-            proxy_cfg["password"] = u.password
+async def _warmup_google(page) -> None:
+    try:
+        log.info("Warmup: visiting google.com")
+        await page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=20_000)
+        await _hd(1.5, 3.0)
+        await _human_mouse_move(page)
+        consent = page.locator(
+            "button:has-text('Accept all'), "
+            "button:has-text('Accept'), "
+            "button:has-text('I agree'), "
+            "button:has-text('Reject all')"
+        )
+        if await consent.count() > 0:
+            try:
+                await consent.first.click(timeout=3000)
+                await _hd(1.0, 2.0)
+            except Exception:
+                pass
+        search = page.locator('textarea[name="q"], input[name="q"]')
+        if await search.count() > 0:
+            queries = ["weather today", "latest news", "best restaurants near me", "time now"]
+            try:
+                await search.first.click()
+                await _hd(0.3, 0.8)
+                await search.first.type(random.choice(queries), delay=random.randint(50, 120))
+                await _hd(0.5, 1.5)
+                await page.keyboard.press("Escape")
+                await _hd(0.5, 1.0)
+            except Exception:
+                pass
+        log.info("Warmup complete")
+    except Exception as exc:
+        log.warning("Warmup failed (non-fatal): %s", exc)
 
-    browser = await pw.chromium.launch(
-        headless=True,
-        proxy=proxy_cfg,
-        args=[
+
+# ---------------------------------------------------------------------------
+# Browser launch — Camoufox first, then Patchright, then Playwright
+# ---------------------------------------------------------------------------
+
+def _build_proxy_cfg() -> Optional[Dict[str, str]]:
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if not proxy_url:
+        return None
+    u = urlparse(proxy_url)
+    cfg: Dict[str, str] = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        cfg["username"] = u.username
+    if u.password:
+        cfg["password"] = u.password
+    return cfg
+
+
+async def _launch_camoufox() -> Optional[Tuple[Any, Any, Any, Any]]:
+    """Returns (cleanup_callable, browser, context, page) or None on failure."""
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except ImportError:
+        log.info("Camoufox not installed — skipping")
+        return None
+
+    proxy_cfg = _build_proxy_cfg()
+    kwargs: Dict[str, Any] = {"headless": True, "humanize": True, "i_know_what_im_doing": True}
+    if proxy_cfg:
+        kwargs["proxy"] = proxy_cfg
+    try:
+        log.info("Launching Camoufox (proxy=%s)", "yes" if proxy_cfg else "no")
+        cm = AsyncCamoufox(**kwargs)
+        browser = await cm.__aenter__()
+        ctx = await browser.new_context()
+        await ctx.add_init_script(_EXTRA_STEALTH_JS)
+        page = await ctx.new_page()
+        page.set_default_timeout(25_000)
+
+        async def _cleanup():
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+        return _cleanup, browser, ctx, page
+    except Exception as exc:
+        log.warning("Camoufox launch failed: %s", exc)
+        return None
+
+
+async def _launch_patchright() -> Optional[Tuple[Any, Any, Any, Any]]:
+    try:
+        from patchright.async_api import async_playwright as patchright_pw
+    except ImportError:
+        log.info("Patchright not installed — skipping")
+        return None
+    proxy_cfg = _build_proxy_cfg()
+    try:
+        pw_inst = await patchright_pw().start()
+        kwargs: Dict[str, Any] = {
+            "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars", "--disable-dev-shm-usage",
+                "--disable-extensions", "--no-sandbox",
+                "--window-size=1280,800",
+            ],
+        }
+        if proxy_cfg:
+            kwargs["proxy"] = proxy_cfg
+        ua = random.choice(_STEALTH_UAS)
+        browser = await pw_inst.chromium.launch(**kwargs)
+        ctx = await browser.new_context(
+            user_agent=ua,
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        await ctx.add_init_script(_EXTRA_STEALTH_JS)
+        page = await ctx.new_page()
+        page.set_default_timeout(25_000)
+
+        async def _cleanup():
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw_inst.stop()
+            except Exception:
+                pass
+
+        return _cleanup, browser, ctx, page
+    except Exception as exc:
+        log.warning("Patchright launch failed: %s", exc)
+        return None
+
+
+async def _launch_playwright(pw) -> Tuple[Any, Any, Any, Any]:
+    proxy_cfg = _build_proxy_cfg()
+    kwargs: Dict[str, Any] = {
+        "headless": True,
+        "args": [
             "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-            "--disable-extensions",
-            "--no-sandbox",
+            "--disable-infobars", "--disable-dev-shm-usage",
+            "--disable-extensions", "--no-sandbox",
             "--window-size=1280,800",
         ],
-    )
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.6778.86 Safari/537.36"
-    )
+    }
+    if proxy_cfg:
+        kwargs["proxy"] = proxy_cfg
+    ua = random.choice(_STEALTH_UAS)
+    is_mac = "Macintosh" in ua
+    browser = await pw.chromium.launch(**kwargs)
     ctx = await browser.new_context(
         user_agent=ua,
         viewport={"width": 1280, "height": 800},
         locale="en-US",
     )
-    await ctx.add_init_script(
-        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-    )
+    await ctx.add_init_script(_EXTRA_STEALTH_JS)
     try:
         from playwright_stealth import Stealth
         stealth = Stealth(
             navigator_user_agent_override=ua,
             navigator_vendor_override="Google Inc.",
-            navigator_platform_override="Win32",
+            navigator_platform_override="MacIntel" if is_mac else "Win32",
+            navigator_languages_override=["en-US", "en"],
         )
         await stealth.apply_stealth_async(ctx)
     except Exception as exc:
-        log.warning("playwright-stealth unavailable or failed: %s", exc)
+        log.warning("playwright-stealth unavailable: %s", exc)
     page = await ctx.new_page()
-    page.set_default_timeout(20_000)
-    return browser, ctx, page
+    page.set_default_timeout(25_000)
 
-
-# ---------------------------------------------------------------------------
-# Step implementations
-# ---------------------------------------------------------------------------
-
-async def _do_login(page, gmail: str, old_password: str, old_totp_secret: str,
-                    on_progress: ProgressCallback) -> str:
-    """Returns name of last completed login step. Raises on failure."""
-    await on_progress("step:google_login_email")
-
-    signin_urls = [
-        "https://accounts.google.com/v3/signin/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin",
-        "https://accounts.google.com/ServiceLogin",
-        "https://accounts.google.com/signin/v2/identifier?hl=en",
-    ]
-    last_nav_error = None
-    for url in signin_urls:
+    async def _cleanup():
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+            await page.close()
+        except Exception:
+            pass
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    return _cleanup, browser, ctx, page
+
+
+# ---------------------------------------------------------------------------
+# Login flow
+# ---------------------------------------------------------------------------
+
+_SIGNIN_URLS = [
+    "https://accounts.google.com/v3/signin/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin",
+    "https://accounts.google.com/ServiceLogin",
+    "https://accounts.google.com/signin/v2/identifier?hl=en",
+]
+
+
+async def _enter_email(page, gmail: str) -> bool:
+    """Navigate to a sign-in URL and submit the email. Returns True on success."""
+    last_err = None
+    for url in _SIGNIN_URLS:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             break
         except Exception as exc:
-            last_nav_error = exc
+            last_err = exc
             await _hd(1.5, 2.5)
     else:
-        raise RuntimeError(f"تعذّر فتح صفحة تسجيل دخول Google: {last_nav_error}")
+        raise RuntimeError(f"تعذّر فتح صفحة تسجيل دخول Google: {last_err}")
 
     await _hd(2, 4)
+    await _human_mouse_move(page)
 
-    email_loc = await _wait_for_visible_locator(
-        page,
-        ['input[type="email"]', 'input#identifierId'],
-        timeout_ms=20_000,
-    )
+    try:
+        title = (await page.title()).lower()
+        if "couldn" in title and "sign" in title:
+            log.warning("Hit 'Couldn't sign you in' on initial load")
+            return False
+    except Exception:
+        pass
+
+    try:
+        email_loc = await _wait_for_visible_locator(
+            page,
+            ['input[type="email"]', 'input#identifierId'],
+            timeout_ms=20_000,
+        )
+    except Exception as exc:
+        log.warning("Email field not visible: %s", exc)
+        return False
+
     await email_loc.click()
     await _hd(0.3, 0.8)
     await email_loc.type(gmail, delay=random.randint(40, 120))
@@ -323,14 +500,40 @@ async def _do_login(page, gmail: str, old_password: str, old_totp_secret: str,
         await next_btn.click()
     else:
         await page.keyboard.press("Enter")
+    return True
+
+
+async def _do_login(page_holder: Dict[str, Any], gmail: str, old_password: str,
+                    old_totp_secret: str, on_progress: ProgressCallback) -> str:
+    """page_holder is a dict with 'page' and 'ctx' so we can swap the page on retry."""
+    await on_progress("step:google_login_email")
+    page = page_holder["page"]
+    ctx = page_holder["ctx"]
+
+    # Warmup first — this is what made the old version work
+    await _warmup_google(page)
+
+    if not await _enter_email(page, gmail):
+        # Retry with a fresh page
+        log.info("Retrying email entry on a fresh page")
+        try:
+            await page.close()
+        except Exception:
+            pass
+        page = await ctx.new_page()
+        page.set_default_timeout(25_000)
+        page_holder["page"] = page
+        await _hd(2, 4)
+        if not await _enter_email(page, gmail):
+            raise RuntimeError("Google يرفض الاتصال (Couldn't sign you in) — جرّب بروكسي مختلف")
 
     await on_progress("step:google_login_password")
-    # ننتظر شبكة هادئة لضمان تحميل صفحة كلمة السر بالكامل قبل البحث عن الحقل
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except Exception:
         pass
     await _hd(2.0, 3.5)
+    await _human_mouse_move(page)
 
     pwd_loc = await _wait_for_visible_locator(
         page,
@@ -355,63 +558,57 @@ async def _do_login(page, gmail: str, old_password: str, old_totp_secret: str,
         await page.keyboard.press("Enter")
     await _hd(3, 5)
 
-    # Detect wrong password
-    body = ""
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
-        pass
+        body = ""
     if any(k in body for k in [
-        "wrong password", "couldn't find your google account", "couldn’t find your google account",
-        "wasn't recognized", "كلمة المرور غير صحيحة",
+        "wrong password", "couldn't find your google account",
+        "couldn’t find your google account", "wasn't recognized",
+        "كلمة المرور غير صحيحة",
     ]):
-        raise RuntimeError("Wrong password / account not found")
+        raise RuntimeError("كلمة سر خاطئة أو الحساب غير موجود")
 
-    # 2FA
     await on_progress("step:google_login_2fa")
     if old_totp_secret:
-        # If device-tap appeared, switch to TOTP
         await _switch_to_totp_method(page)
-
-        totp_input_sel = (
+        totp_sel = (
             'input[type="tel"], input#totpPin, input[name="totpPin"], '
             'input[autocomplete="one-time-code"]'
         )
         try:
-            await page.wait_for_selector(totp_input_sel, timeout=15_000, state="visible")
+            await page.wait_for_selector(totp_sel, timeout=15_000, state="visible")
         except Exception:
-            # Maybe still on device-tap screen — try once more
             if await _switch_to_totp_method(page):
-                await page.wait_for_selector(totp_input_sel, timeout=15_000, state="visible")
+                await page.wait_for_selector(totp_sel, timeout=15_000, state="visible")
             else:
                 raise RuntimeError("لم يظهر حقل إدخال رمز Authenticator")
 
         code = _now_totp(old_totp_secret)
-        await _type_human(page, totp_input_sel, code)
+        await _type_human_at(page, totp_sel, code)
         await _hd(0.4, 0.9)
         await page.keyboard.press("Enter")
         await _hd(2.5, 4)
     else:
-        # No TOTP supplied — wait & hope the account has no 2FA
         await _hd(2, 4)
 
-    # Skip "Stay signed in" / "save device" prompts
     for label in ["not now", "ليس الآن", "skip", "تخطي"]:
         if await _click_text(page, [label], 1500):
             await _hd(0.6, 1.2)
             break
 
-    # Confirm we landed somewhere logged-in
     cur = page.url
     if "signin/challenge" in cur or "signin/v2" in cur:
-        # Final attempt: maybe a recovery email/phone prompt blocks us
         raise RuntimeError("الحساب يطلب تأكيد إضافي (Recovery) — يلزم تدخّل يدوي")
 
     return "google_login_2fa"
 
 
+# ---------------------------------------------------------------------------
+# Change password / setup new authenticator / verify
+# ---------------------------------------------------------------------------
+
 async def _change_password(page, on_progress: ProgressCallback) -> str:
-    """Change account password. Returns the new password."""
     await on_progress("step:open_security_page")
     new_pwd = _generate_strong_password(16)
 
@@ -421,20 +618,16 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
     )
     await _hd(2, 3.5)
 
-    # Sometimes Google asks to re-authenticate here
     pwd_sel = 'input[type="password"]'
     try:
         await page.wait_for_selector(pwd_sel, timeout=15_000, state="visible")
     except Exception:
         raise RuntimeError("لم تُفتح صفحة تغيير كلمة السر")
 
-    # Two password fields: new + confirm
     await on_progress("step:change_password")
     fields = page.locator('input[type="password"]')
     n = await fields.count()
     if n < 2:
-        # Possibly need re-auth first — fill with old? We don't have it here.
-        # Wait a bit and re-check.
         await _hd(2, 3)
         n = await fields.count()
     if n < 2:
@@ -450,26 +643,21 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
     await _hd(0.4, 0.9)
 
     if not await _click_text(page, ["change password", "save", "تغيير كلمة المرور", "حفظ"], 4000):
-        # Fallback: press Enter
         await page.keyboard.press("Enter")
-
     await _hd(3, 5)
 
-    body = ""
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
-        pass
+        body = ""
     if any(k in body for k in ["password changed", "تم تغيير", "تم الحفظ"]):
         return new_pwd
-    # Heuristic: if URL changed away from /password we treat as success
     if "/signinoptions/password" not in page.url:
         return new_pwd
     raise RuntimeError("تعذّر تأكيد تغيير كلمة السر")
 
 
 async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
-    """Reset 2-step verification: add a new Authenticator app and capture its secret."""
     await on_progress("step:open_2fa_settings")
     await page.goto(
         "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
@@ -477,19 +665,15 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
     )
     await _hd(2, 3.5)
 
-    # Click "Authenticator" entry
     await on_progress("step:enable_new_authenticator")
     await _click_text(page, ["authenticator", "تطبيق المصادقة"], 5000)
     await _hd(1.5, 2.5)
-
-    # "Set up authenticator" / "Get started" / "+ ADD"
     await _click_text(page, [
         "set up authenticator", "set up", "+ add authenticator",
         "get started", "إعداد", "بدء",
     ], 5000)
     await _hd(1.5, 2.5)
 
-    # Click "Can't scan it?" to reveal the secret key
     revealed = await _click_text(page, [
         "can't scan it", "can’t scan it", "can't scan", "لا يمكنك المسح",
         "show secret", "show key",
@@ -498,22 +682,16 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
 
     secret = ""
     if revealed:
-        # Try to read the secret text from the page
         try:
             html = await page.content()
-            # Look for a base32 chunk (>= 16 chars)
             m = re.search(r"\b([A-Z2-7]{4}\s?[A-Z2-7]{4}\s?[A-Z2-7]{4}\s?[A-Z2-7]{4}[A-Z2-7\s]*)\b", html)
             if m:
                 secret = m.group(1).replace(" ", "").upper()
         except Exception:
             pass
-
     if not secret:
-        # Fallback: use our own generated secret. Google won't accept it because
-        # the displayed QR is server-issued. So we mark partial-success.
         raise RuntimeError("تعذّر استخراج مفتاح Authenticator الجديد من Google")
 
-    # Click "Next" to reach the verify-code step
     await _click_text(page, ["next", "التالي"], 5000)
     await _hd(1.0, 2.0)
 
@@ -523,38 +701,30 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
         'input[autocomplete="one-time-code"]'
     )
     await page.wait_for_selector(code_sel, timeout=15_000, state="visible")
-    await _type_human(page, code_sel, code)
+    await _type_human_at(page, code_sel, code)
     await _hd(0.5, 1.2)
-    await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000) or await page.keyboard.press("Enter")
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000):
+        await page.keyboard.press("Enter")
     await _hd(2, 4)
-
     return secret
 
 
 async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
                           on_progress: ProgressCallback) -> bool:
-    """Sign out then sign back in with the new credentials to confirm everything works."""
     await on_progress("step:verify_new_2fa")
     try:
-        await page.goto(
-            "https://accounts.google.com/Logout",
-            wait_until="domcontentloaded",
-            timeout=20_000,
-        )
+        await page.goto("https://accounts.google.com/Logout",
+                        wait_until="domcontentloaded", timeout=20_000)
         await _hd(2, 3)
     except Exception:
         pass
 
-    await page.goto(
-        "https://accounts.google.com/signin/v2/identifier?hl=en",
-        wait_until="domcontentloaded",
-    )
+    await page.goto("https://accounts.google.com/signin/v2/identifier?hl=en",
+                    wait_until="domcontentloaded")
     await _hd(1.5, 2.5)
 
     email_loc = await _wait_for_visible_locator(
-        page,
-        ['input[type="email"]', 'input#identifierId'],
-        timeout_ms=20_000,
+        page, ['input[type="email"]', 'input#identifierId'], timeout_ms=20_000,
     )
     await email_loc.click()
     await _hd(0.3, 0.8)
@@ -566,12 +736,12 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
         await next_btn.click()
     else:
         await page.keyboard.press("Enter")
-
     await _hd(2, 3)
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except Exception:
         pass
+
     pwd_loc = await _wait_for_visible_locator(
         page,
         [
@@ -601,11 +771,10 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
     try:
         await page.wait_for_selector(code_sel, timeout=15_000, state="visible")
     except Exception:
-        return True  # No 2FA challenge — still considered logged-in
-    await _type_human(page, code_sel, _now_totp(new_secret))
+        return True
+    await _type_human_at(page, code_sel, _now_totp(new_secret))
     await page.keyboard.press("Enter")
     await _hd(2, 4)
-
     return "myaccount" in page.url or "signin" not in page.url
 
 
@@ -621,7 +790,6 @@ async def rotate_google_account(
     old_totp_secret: str,
     user_id: int,
 ) -> Dict[str, Any]:
-    """Rotate a Google account's password and 2FA secret."""
     result: Dict[str, Any] = {
         "success": False,
         "gmail": gmail,
@@ -639,7 +807,6 @@ async def rotate_google_account(
     if not old_password:
         result["error"] = "كلمة السر القديمة مطلوبة"
         return result
-
     if old_totp_secret:
         try:
             pyotp.TOTP(old_totp_secret.replace(" ", "").upper()).now()
@@ -647,15 +814,6 @@ async def rotate_google_account(
             result["error"] = f"مفتاح 2FA القديم غير صالح: {exc}"
             return result
 
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        result["error"] = "Playwright غير مُثبَّت. شغّل: pip install playwright && playwright install chromium"
-        return result
-
-    pw_cm = async_playwright()
-    pw = await pw_cm.__aenter__()
-    browser = ctx = page = None
     current_step = "launch_browser"
 
     async def _progress_wrap(s: str) -> None:
@@ -667,11 +825,38 @@ async def rotate_google_account(
         except Exception:
             pass
 
+    cleanup = browser = ctx = page = None
+    pw_cm = pw = None
+
     try:
         await _progress_wrap("step:launch_browser")
-        browser, ctx, page = await _launch_browser(pw)
 
-        await _do_login(page, gmail, old_password, old_totp_secret, _progress_wrap)
+        # 1) Try Camoufox (best anti-detection)
+        result_launch = await _launch_camoufox()
+        engine = "camoufox"
+        if not result_launch:
+            # 2) Try Patchright
+            result_launch = await _launch_patchright()
+            engine = "patchright"
+        if not result_launch:
+            # 3) Fallback to Playwright Chromium
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                result["error"] = "لا توجد متصفحات مثبتة (Camoufox/Patchright/Playwright)"
+                return result
+            pw_cm = async_playwright()
+            pw = await pw_cm.__aenter__()
+            result_launch = await _launch_playwright(pw)
+            engine = "playwright"
+
+        cleanup, browser, ctx, page = result_launch
+        log.info("Browser engine: %s", engine)
+
+        page_holder = {"page": page, "ctx": ctx}
+        await _do_login(page_holder, gmail, old_password, old_totp_secret, _progress_wrap)
+        page = page_holder["page"]  # may have been swapped
+
         new_password = await _change_password(page, _progress_wrap)
         result["new_password"] = new_password
 
@@ -696,16 +881,16 @@ async def rotate_google_account(
         return result
 
     finally:
-        for closer in (page, ctx, browser):
-            if closer is not None:
-                try:
-                    await closer.close()
-                except Exception:
-                    pass
-        try:
-            await pw_cm.__aexit__(None, None, None)
-        except Exception:
-            pass
+        if cleanup:
+            try:
+                await cleanup()
+            except Exception:
+                pass
+        if pw_cm:
+            try:
+                await pw_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 def _format_progress(step: str) -> str:
