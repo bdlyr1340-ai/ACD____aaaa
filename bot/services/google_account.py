@@ -1152,23 +1152,59 @@ async def _setup_new_authenticator(
         "turn on 2-step verification", "turn on 2-step", "تفعيل التحقّق",
         "تفعيل المصادقة الثنائية", "تفعيل التحقق",
     ])
+
+    # Detect if a phone number is already on the account. If "Add a phone number"
+    # is visible in the Second steps section, the account has none.
+    phone_already_set = True
+    try:
+        if "add a phone number" in body or "إضافة رقم هاتف" in body:
+            phone_already_set = False
+    except Exception:
+        pass
+    log.info("State: needs_turn_on=%s phone_already_set=%s", needs_turn_on, phone_already_set)
+
+    # ── PROACTIVE: add phone FIRST (before clicking Turn on 2SV) ──
+    # This avoids the "Add second steps to your account" dialog entirely on
+    # accounts that have only a passkey. We add the phone as a second step
+    # while 2SV is still off, then turn 2SV on cleanly.
+    if needs_turn_on and not phone_already_set and phone_to_add:
+        log.info("Adding phone number proactively BEFORE turning on 2SV")
+        await on_progress("step:add_phone_number")
+        try:
+            added = await _add_phone_number(page, phone_to_add, sms_code_provider)
+            await _snap("after_proactive_add_phone")
+            if added:
+                # Reload 2SV page to refresh state
+                await _hd(2, 3)
+                try:
+                    await page.goto(
+                        "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
+                        wait_until="domcontentloaded",
+                    )
+                    await _hd(2, 3.5)
+                    await _reauth_if_needed(page, current_password)
+                    await _hd(1.5, 2.5)
+                    await _snap("2sv_page_after_phone")
+                except Exception as exc:
+                    log.warning("Could not reload 2SV page after phone add: %s", exc)
+            else:
+                log.warning("Proactive phone add did not succeed — will try fallback path")
+        except Exception as exc:
+            log.warning("Proactive phone add raised: %s — continuing", exc)
+
     if needs_turn_on:
-        log.info("2SV is OFF — clicking 'Turn on 2-Step Verification'")
+        log.info("Clicking 'Turn on 2-Step Verification'")
         if await _click_turn_on_2sv(page):
             await _hd(2, 3.5)
             await _reauth_if_needed(page, current_password)
             await _hd(1.5, 2.5)
             await _snap("after_click_turn_on_2sv")
 
-            # Google may show the "Add second steps to your account" dialog
-            # asking us to add a phone number first. Detect more aggressively:
-            # the dialog text might be inside a modal that's not in body.lower(),
-            # so we also check page.content() (full HTML) and look for the dialog
-            # role explicitly. We also retry detection up to 3 times with delays.
+            # FALLBACK: if the dialog still appears (phone add failed earlier
+            # or for any other reason), detect and handle it as before.
             needs_phone = False
             for attempt in range(3):
                 body = await _read_body()
-                # Check 1: visible text in body
                 if any(kw in body for kw in [
                     "add second steps", "add another one or add another second step",
                     "doesn't sync across your devices", "first add second steps",
@@ -1177,7 +1213,6 @@ async def _setup_new_authenticator(
                     needs_phone = True
                     log.info("Detected 'Add second steps' dialog (body match)")
                     break
-                # Check 2: full HTML content
                 try:
                     html = (await page.content()).lower()
                     if any(kw in html for kw in [
@@ -1189,7 +1224,6 @@ async def _setup_new_authenticator(
                         break
                 except Exception:
                     pass
-                # Check 3: explicit dialog with "Go back" button
                 try:
                     go_back = page.locator(
                         '[role="dialog"] button:has-text("Go back"), '
@@ -1202,18 +1236,15 @@ async def _setup_new_authenticator(
                         break
                 except Exception:
                     pass
-                # Check 4: still on 2SV page (i.e., 2SV did NOT actually turn on)
                 if "two-step-verification" in page.url and attempt > 0:
-                    # If after retry we're still here, Google likely needs a phone
                     log.info("Still on 2SV page after click — assuming phone needed")
                     needs_phone = True
                     break
                 await _hd(1.5, 2.5)
 
             if needs_phone:
-                log.info("Google requires a second step (phone number) first")
+                log.info("Fallback: dialog appeared, adding phone now")
                 await _snap("dialog_add_second_steps")
-                # Dismiss the dialog with "Go back" so the phone-number row is clickable
                 await _click_text(page, ["go back", "العودة", "رجوع", "back"], 3000)
                 await _hd(1.5, 2.5)
 
@@ -1222,7 +1253,6 @@ async def _setup_new_authenticator(
                     added = await _add_phone_number(page, phone_to_add, sms_code_provider)
                     await _snap("after_add_phone_number")
                     if added:
-                        # After adding the phone, retry "Turn on 2-Step Verification"
                         await _hd(2, 3)
                         try:
                             await page.goto(
