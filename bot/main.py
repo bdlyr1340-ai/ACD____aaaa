@@ -81,7 +81,6 @@ def build_app() -> Application:
 
     # Buttons & messages
     app.add_handler(CallbackQueryHandler(h_start.on_button))
-    # Accept any uploaded document (txt or otherwise) — handler filters by content
     app.add_handler(MessageHandler(filters.Document.ALL, h_rotate.on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, h_rotate.on_text))
     app.add_error_handler(on_error)
