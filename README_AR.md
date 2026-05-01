@@ -1,54 +1,40 @@
-# Google Account Rotator Bot
+# 🔄 إصلاح آمن لتسجيل الدخول (إرجاع للنسخة الكلاسيكية)
 
-بوت تيليجرام يقوم تلقائياً بـ:
-1. تسجيل الدخول إلى حساب Google باستخدام (إيميل + كلمة سر + مفتاح 2FA).
-2. تجاوز شاشة "Tap on your phone" بالتحويل تلقائياً إلى Google Authenticator.
-3. تغيير كلمة السر إلى كلمة قوية جديدة.
-4. إعادة إعداد المصادقة الثنائية وإنشاء مفتاح 2FA جديد.
-5. إرسال البيانات الجديدة (إيميل + كلمة السر + مفتاح 2FA) للمستخدم.
-6. عند أي فشل: إرسال **لقطة شاشة + اسم الخطوة + نص الخطأ** إلى المستخدم وإلى الأدمن.
+## ❗ المشكلة
+نسخة Camoufox + كاشف الحظر المبكر كسرت تسجيل الدخول الذي كان شغال.
 
-## المتغيرات البيئية المطلوبة
+## ✅ الحل في هذا الملف
+- **حذف Camoufox كلياً** — رجوع لـ Playwright العادي.
+- **حذف كاشف "Couldn't sign you in" المبكر** — كان يوقف العملية بدون داعي.
+- **إصلاح وحيد محتفظ به**: تجاهل حقل الباسورد المخفي `hiddenPasswor` عبر selector دقيق:
+  ```
+  input[type="password"][name="Passwd"]:not([aria-hidden="true"]):not([tabindex="-1"])
+  ```
+- إبقاء دعم **Device-tap → Authenticator** (المنطق الذي طلبته سابقاً).
+- إبقاء دعم **PROXY_LIST** (اختياري، يدور بين الحسابات).
+- stealth خفيف يدوي (إخفاء `navigator.webdriver`).
 
-| المتغير | الوصف |
-|---|---|
-| `BOT_TOKEN` | توكن البوت من BotFather |
-| `DATABASE_URL` | رابط Postgres (Railway) |
-| `ADMIN_IDS` | معرّفات الأدمن مفصولة بفواصل |
-| `PROXY_URL` | (اختياري) `http://user:pass@host:port` |
-| `DEFAULT_CREDITS` | الرصيد الافتراضي (3) |
-| `ROTATE_COST` | تكلفة كل عملية (1) |
-| `MAX_BULK_ACCOUNTS` | الحد الأقصى للقائمة (30) |
-| `ROTATE_TIMEOUT_SEC` | المهلة لكل حساب (300) |
+## 📦 طريقة التثبيت
+1. فك الضغط.
+2. استبدل ملف **`bot/services/google_account.py`** فقط بالملف الجديد.
+3. أعد تشغيل البوت في Railway.
 
-## التشغيل المحلي
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-python main.py
+## 🧹 المتغيرات المطلوبة (الأساسية فقط)
+```
+BOT_TOKEN=...
+ADMIN_IDS=...
+DATABASE_URL=...
+HEADLESS=true
+DEVICE_TAP_WAIT_SEC=75
+PROXY_LIST=          ← اختياري، اتركه فارغاً إن أردت
 ```
 
-## Railway
+**احذف من Railway** (لم تعد مطلوبة):
+- `USE_CAMOUFOX`
+- `USE_STEALTH`
+- `CAMOUFOX_GEOIP`
+- `MAX_RETRIES_ON_BLOCK`
 
-ملفات `Procfile` و `Dockerfile` و `railway.json` جاهزة. ارفع المستودع و عرّف المتغيرات أعلاه.
-
-## استخدام البوت
-
-- **حساب واحد:** اضغط زر *🔐 تغيير حساب* ثم أرسل:
-  ```
-  email@gmail.com | OldPassword | OLD2FASECRET
-  ```
-- **قائمة حسابات:** اضغط *📋 قائمة حسابات* وأرسل ملف نصي / رسالة فيها سطر لكل حساب بنفس الصيغة.
-- إن لم يوجد 2FA على الحساب: ضع `skip` بدلاً من المفتاح.
-
-## أوامر
-
-`/start /me /ref /qd /use /help`  
-أوامر الأدمن: `/admin /stats /addcredit /ban /unban /broadcast /genkey /listkeys`
-
-## ملاحظات هامة
-
-- Google قد يطلب أحياناً تأكيد عبر Recovery Email/Phone — عندها يبلّغ البوت عن الحاجة لتدخّل يدوي ويرسل لقطة الشاشة بدلاً من الفشل الصامت.
-- يُنصح باستخدام بروكسي residential لتقليل احتمالات الحظر من Google.
-- مفتاح TOTP في الإدخال يجب أن يكون نصاً Base32 (مثل `JBSWY3DPEHPK3PXP`)، وليس الكود السداسي المؤقت.
+## 📝 ملاحظة
+الملف يحتوي منطق تسجيل الدخول + توليد كلمة السر/2FA الجديدة فقط.
+دوال `change_password` و `setup_new_2fa` التفصيلية يجب إبقاؤها كما هي في نسختك السابقة، أو أخبرني لأرسلها كاملة في حزمة ثانية.
