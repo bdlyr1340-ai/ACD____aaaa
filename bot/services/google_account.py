@@ -958,6 +958,67 @@ async def _reauth_if_needed(page, current_password: str) -> None:
         log.warning("Re-auth attempt failed: %s", exc)
 
 
+async def _add_phone_number(page, phone: str) -> bool:
+    """Click 'Add a phone number' on the 2SV page, enter the number, verify
+    via SMS code if Google asks (best-effort). Returns True on success.
+
+    Note: SMS verification cannot be automated without a real number that
+    can receive SMS. We fill the number and submit; if Google sends a code
+    and waits, we return True after submission so the caller can decide.
+    """
+    log.info("Adding phone number: %s", phone)
+
+    # Click the "Add a phone number" row
+    clicked = False
+    for sel in [
+        'div:has-text("Add a phone number")',
+        '[role="button"]:has-text("Add a phone number")',
+        'button:has-text("Add a phone number")',
+        'a:has-text("Add a phone number")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=4000)
+                clicked = True
+                log.info("Clicked 'Add a phone number' via: %s", sel)
+                break
+        except Exception:
+            continue
+    if not clicked:
+        clicked = await _click_text(page, [
+            "add a phone number", "add phone number", "إضافة رقم هاتف",
+        ], 5000)
+    if not clicked:
+        log.warning("Could not click 'Add a phone number'")
+        return False
+
+    await _hd(2, 3.5)
+
+    # Wait for the phone-input field
+    phone_sel = (
+        'input[type="tel"], input[name="phoneNumber"], '
+        'input[aria-label*="phone" i], input[autocomplete="tel"]'
+    )
+    try:
+        await page.wait_for_selector(phone_sel, timeout=10_000, state="visible")
+    except Exception:
+        log.warning("Phone input field not visible")
+        return False
+
+    phone_loc = page.locator(phone_sel).first
+    await phone_loc.click()
+    await _hd(0.3, 0.7)
+    await phone_loc.type(phone, delay=random.randint(40, 90))
+    await _hd(0.5, 1.2)
+
+    # Submit
+    if not await _click_text(page, ["next", "send", "التالي", "إرسال", "save", "حفظ"], 4000):
+        await page.keyboard.press("Enter")
+    await _hd(2.5, 4)
+    return True
+
+
 async def _setup_new_authenticator(page, on_progress: ProgressCallback,
                                    current_password: str) -> str:
     await on_progress("step:open_2fa_settings")
@@ -971,11 +1032,16 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback,
     await _reauth_if_needed(page, current_password)
     await _hd(1.5, 2.5)
 
-    # Step 1: If 2SV is currently OFF, turn it on first
-    try:
-        body = (await page.inner_text("body")).lower()
-    except Exception:
-        body = ""
+    phone_to_add = os.environ.get("FALLBACK_PHONE", "").strip()
+
+    # Step 1: If 2SV is currently OFF, try to turn it on
+    async def _read_body() -> str:
+        try:
+            return (await page.inner_text("body")).lower()
+        except Exception:
+            return ""
+
+    body = await _read_body()
     needs_turn_on = any(kw in body for kw in [
         "turn on 2-step verification", "turn on 2-step", "تفعيل التحقّق",
         "تفعيل المصادقة الثنائية", "تفعيل التحقق",
@@ -984,10 +1050,49 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback,
         log.info("2SV is OFF — clicking 'Turn on 2-Step Verification'")
         if await _click_turn_on_2sv(page):
             await _hd(2, 3.5)
-            # Google may re-prompt for password after clicking
             await _reauth_if_needed(page, current_password)
             await _hd(1.5, 2.5)
-            # Skip phone-number / Google-prompt setup wizards
+
+            # Google may show the "Add second steps to your account" dialog
+            # asking us to add a phone number first. Detect & handle it.
+            body = await _read_body()
+            needs_phone = any(kw in body for kw in [
+                "add second steps", "add another one or add another second step",
+                "doesn't sync across your devices", "add a phone number",
+                "إضافة طرق تحقق", "إضافة رقم هاتف",
+            ])
+            if needs_phone:
+                log.info("Google requires a second step (phone number) first")
+                # Dismiss the dialog with "Go back" so the phone-number row is clickable
+                await _click_text(page, ["go back", "العودة", "رجوع", "back"], 3000)
+                await _hd(1.5, 2.5)
+
+                if phone_to_add:
+                    added = await _add_phone_number(page, phone_to_add)
+                    if added:
+                        # After adding the phone, retry "Turn on 2-Step Verification"
+                        await _hd(2, 3)
+                        try:
+                            await page.goto(
+                                "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
+                                wait_until="domcontentloaded",
+                            )
+                            await _hd(2, 3.5)
+                            await _reauth_if_needed(page, current_password)
+                            await _hd(1.5, 2.5)
+                        except Exception as exc:
+                            log.warning("Could not reload 2SV page: %s", exc)
+                        if await _click_turn_on_2sv(page):
+                            await _hd(2, 3.5)
+                            await _reauth_if_needed(page, current_password)
+                            await _hd(1.5, 2.5)
+                else:
+                    raise RuntimeError(
+                        "Google يطلب إضافة رقم هاتف لتفعيل 2SV. "
+                        "أضف متغير البيئة FALLBACK_PHONE برقم الهاتف وأعد المحاولة."
+                    )
+
+            # Skip any leftover wizard prompts
             for label in [
                 "skip", "تخطي", "not now", "ليس الآن", "later", "لاحقاً",
                 "use another method", "use a different method",
