@@ -29,6 +29,35 @@ import pyotp
 log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+ScreenshotCallback = Callable[[str, str], Awaitable[None]]  # (step_name, file_path) -> None
+SmsCodeProvider = Callable[[], Awaitable[Optional[str]]]
+CredentialsCallback = Callable[[str, str], Awaitable[None]]  # (label, value) -> None
+
+# Default fixed values (override via env vars)
+DEFAULT_NEW_PASSWORD = "VJ77X2305xx30j5"
+DEFAULT_FALLBACK_PHONE = "07728257333"
+
+
+async def _shoot(page, user_id: int, tag: str,
+                 on_screenshot: Optional[ScreenshotCallback] = None) -> None:
+    """Capture a screenshot and notify the caller via callback (if provided).
+
+    Used to send progress screenshots to the Telegram user after every step,
+    so they can debug what the bot is seeing. Failures are non-fatal.
+    """
+    if page is None:
+        return
+    try:
+        ts = int(time.time() * 1000)
+        path = os.path.join(SHOTS_DIR, f"{user_id}_{ts}_{tag}.png")
+        await page.screenshot(path=path, full_page=True, timeout=10_000)
+        if on_screenshot is not None:
+            try:
+                await on_screenshot(tag, path)
+            except Exception as exc:
+                log.warning("on_screenshot callback failed: %s", exc)
+    except Exception as exc:
+        log.warning("Screenshot at %s failed: %s", tag, exc)
 
 # ---------------------------------------------------------------------------
 # Steps & labels (unchanged public contract)
@@ -42,6 +71,7 @@ ROTATION_STEPS: List[str] = [
     "open_security_page",
     "change_password",
     "open_2fa_settings",
+    "add_phone_number",
     "enable_new_authenticator",
     "verify_new_2fa",
     "done",
@@ -55,6 +85,7 @@ STEP_LABELS_AR: Dict[str, str] = {
     "open_security_page":       "فتح إعدادات الأمان",
     "change_password":          "تغيير كلمة السر",
     "open_2fa_settings":        "فتح إعدادات 2FA",
+    "add_phone_number":         "إضافة رقم الهاتف",
     "enable_new_authenticator": "إضافة Authenticator جديد",
     "verify_new_2fa":           "تأكيد المصادقة الجديدة",
     "done":                     "مكتمل",
@@ -797,7 +828,12 @@ async def _click_change_password_button(page) -> bool:
 
 async def _change_password(page, on_progress: ProgressCallback) -> str:
     await on_progress("step:open_security_page")
-    new_pwd = _generate_strong_password(16)
+    # Use fixed password from env var or hard-coded default
+    new_pwd = os.environ.get("NEW_PASSWORD", DEFAULT_NEW_PASSWORD).strip()
+    if not new_pwd or len(new_pwd) < 8:
+        log.warning("NEW_PASSWORD too short, falling back to default")
+        new_pwd = DEFAULT_NEW_PASSWORD
+    log.info("Using fixed password (len=%d)", len(new_pwd))
 
     await page.goto(
         "https://myaccount.google.com/signinoptions/password?hl=en",
@@ -1082,13 +1118,20 @@ async def _setup_new_authenticator(
     on_progress: ProgressCallback,
     current_password: str,
     sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    *,
+    on_screenshot: Optional[ScreenshotCallback] = None,
+    user_id: int = 0,
 ) -> str:
+    async def _snap(tag: str) -> None:
+        await _shoot(page, user_id, tag, on_screenshot)
+
     await on_progress("step:open_2fa_settings")
     await page.goto(
         "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
         wait_until="domcontentloaded",
     )
     await _hd(2, 3.5)
+    await _snap("2sv_page_loaded")
 
     # Re-auth may be required to open the 2SV settings page itself
     await _reauth_if_needed(page, current_password)
@@ -1115,23 +1158,69 @@ async def _setup_new_authenticator(
             await _hd(2, 3.5)
             await _reauth_if_needed(page, current_password)
             await _hd(1.5, 2.5)
+            await _snap("after_click_turn_on_2sv")
 
             # Google may show the "Add second steps to your account" dialog
-            # asking us to add a phone number first. Detect & handle it.
-            body = await _read_body()
-            needs_phone = any(kw in body for kw in [
-                "add second steps", "add another one or add another second step",
-                "doesn't sync across your devices", "add a phone number",
-                "إضافة طرق تحقق", "إضافة رقم هاتف",
-            ])
+            # asking us to add a phone number first. Detect more aggressively:
+            # the dialog text might be inside a modal that's not in body.lower(),
+            # so we also check page.content() (full HTML) and look for the dialog
+            # role explicitly. We also retry detection up to 3 times with delays.
+            needs_phone = False
+            for attempt in range(3):
+                body = await _read_body()
+                # Check 1: visible text in body
+                if any(kw in body for kw in [
+                    "add second steps", "add another one or add another second step",
+                    "doesn't sync across your devices", "first add second steps",
+                    "إضافة طرق تحقق", "أضف خطوات تحقق",
+                ]):
+                    needs_phone = True
+                    log.info("Detected 'Add second steps' dialog (body match)")
+                    break
+                # Check 2: full HTML content
+                try:
+                    html = (await page.content()).lower()
+                    if any(kw in html for kw in [
+                        "add second steps", "first add second steps",
+                        "doesn't sync across your devices",
+                    ]):
+                        needs_phone = True
+                        log.info("Detected 'Add second steps' dialog (html match)")
+                        break
+                except Exception:
+                    pass
+                # Check 3: explicit dialog with "Go back" button
+                try:
+                    go_back = page.locator(
+                        '[role="dialog"] button:has-text("Go back"), '
+                        '[role="alertdialog"] button:has-text("Go back"), '
+                        'div[aria-modal="true"] button:has-text("Go back")'
+                    ).first
+                    if await go_back.count() and await go_back.is_visible():
+                        needs_phone = True
+                        log.info("Detected 'Add second steps' dialog (Go back button)")
+                        break
+                except Exception:
+                    pass
+                # Check 4: still on 2SV page (i.e., 2SV did NOT actually turn on)
+                if "two-step-verification" in page.url and attempt > 0:
+                    # If after retry we're still here, Google likely needs a phone
+                    log.info("Still on 2SV page after click — assuming phone needed")
+                    needs_phone = True
+                    break
+                await _hd(1.5, 2.5)
+
             if needs_phone:
                 log.info("Google requires a second step (phone number) first")
+                await _snap("dialog_add_second_steps")
                 # Dismiss the dialog with "Go back" so the phone-number row is clickable
                 await _click_text(page, ["go back", "العودة", "رجوع", "back"], 3000)
                 await _hd(1.5, 2.5)
 
                 if phone_to_add:
+                    await on_progress("step:add_phone_number")
                     added = await _add_phone_number(page, phone_to_add, sms_code_provider)
+                    await _snap("after_add_phone_number")
                     if added:
                         # After adding the phone, retry "Turn on 2-Step Verification"
                         await _hd(2, 3)
@@ -1149,6 +1238,7 @@ async def _setup_new_authenticator(
                             await _hd(2, 3.5)
                             await _reauth_if_needed(page, current_password)
                             await _hd(1.5, 2.5)
+                            await _snap("after_2sv_retry")
                 else:
                     raise RuntimeError(
                         "Google يطلب إضافة رقم هاتف لتفعيل 2SV. "
@@ -1166,6 +1256,7 @@ async def _setup_new_authenticator(
             log.warning("Could not find 'Turn on 2-Step Verification' button")
 
     await on_progress("step:enable_new_authenticator")
+    await _snap("before_authenticator_setup")
 
     # Step 2: Open the Authenticator section
     await _click_text(page, [
@@ -1357,7 +1448,9 @@ async def rotate_google_account(
     old_password: str,
     old_totp_secret: str,
     user_id: int,
-    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    sms_code_provider: Optional[SmsCodeProvider] = None,
+    on_screenshot: Optional[ScreenshotCallback] = None,
+    on_credentials_ready: Optional[CredentialsCallback] = None,
 ) -> Dict[str, Any]:
     """Rotate a Google account's password and 2FA secret.
 
@@ -1373,6 +1466,16 @@ async def rotate_google_account(
               2. Waits for the user's reply
               3. Returns the code
             If Google never asks for an SMS code, this is never called.
+        on_screenshot: optional callback called after every major step with
+            (step_name, screenshot_path). Use it to forward screenshots to
+            the user via Telegram so they can debug visually.
+        on_credentials_ready: optional callback called as soon as a new
+            credential is available, with (label, value). Examples:
+                ("new_password", "VJ77X2305xx30j5")
+                ("new_totp_secret", "JBSWY3DPEHPK3PXP")
+            This lets the bot send the new password to the user IMMEDIATELY
+            after it's set, so even if a later step fails, the user has
+            their password already.
     """
     result: Dict[str, Any] = {
         "success": False,
@@ -1412,6 +1515,15 @@ async def rotate_google_account(
     cleanup = browser = ctx = page = None
     pw_cm = pw = None
 
+    async def _emit_credential(label: str, value: str) -> None:
+        """Notify the caller as soon as a credential is ready."""
+        if on_credentials_ready is None or not value:
+            return
+        try:
+            await on_credentials_ready(label, value)
+        except Exception as exc:
+            log.warning("on_credentials_ready callback failed: %s", exc)
+
     try:
         await _progress_wrap("step:launch_browser")
 
@@ -1440,16 +1552,25 @@ async def rotate_google_account(
         page_holder = {"page": page, "ctx": ctx}
         await _do_login(page_holder, gmail, old_password, old_totp_secret, _progress_wrap)
         page = page_holder["page"]  # may have been swapped
+        await _shoot(page, user_id, "after_login", on_screenshot)
 
         new_password = await _change_password(page, _progress_wrap)
         result["new_password"] = new_password
+        # Send the new password to the user IMMEDIATELY
+        await _emit_credential("new_password", new_password)
+        await _shoot(page, user_id, "after_change_password", on_screenshot)
 
         new_secret = await _setup_new_authenticator(
-            page, _progress_wrap, new_password, sms_code_provider
+            page, _progress_wrap, new_password, sms_code_provider,
+            on_screenshot=on_screenshot, user_id=user_id,
         )
         result["new_totp_secret"] = new_secret
+        # Send the new 2FA secret to the user IMMEDIATELY
+        await _emit_credential("new_totp_secret", new_secret)
+        await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
 
         await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap)
+        await _shoot(page, user_id, "after_verify", on_screenshot)
 
         await _progress_wrap("step:done")
         result["success"] = True
@@ -1464,6 +1585,12 @@ async def rotate_google_account(
             cap = await _capture(page, user_id, current_step)
             result["screenshot_path"] = cap["screenshot_path"]
             result["html_path"] = cap["html_path"]
+            # Also push the failure screenshot via the live callback
+            if cap.get("screenshot_path") and on_screenshot is not None:
+                try:
+                    await on_screenshot(f"error_{current_step}", cap["screenshot_path"])
+                except Exception:
+                    pass
         return result
 
     finally:
