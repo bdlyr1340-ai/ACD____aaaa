@@ -215,7 +215,67 @@ async def _click_text(page, substrings: List[str], timeout_ms: int = 4000) -> bo
     return False
 
 
+async def _handle_passkey_screen(page) -> bool:
+    """If Google shows 'Use your passkey', click it then fall through to TOTP.
+
+    The user wants the bot to press 'Use your passkey' first, then switch
+    to the Authenticator code (TOTP) flow. After clicking the passkey button,
+    Google usually shows a system prompt that we cannot satisfy headlessly,
+    so we click 'Try another way' to reach the Authenticator option.
+    """
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+
+    has_passkey = any(kw in body for kw in [
+        "use your passkey", "passkey", "مفتاح المرور", "passkeys",
+    ])
+    if not has_passkey:
+        return False
+
+    log.info("Passkey screen detected — clicking 'Use your passkey'")
+    clicked = await _click_text(page, [
+        "use your passkey", "use passkey", "استخدم مفتاح المرور", "مفتاح المرور",
+    ], 4000)
+    if not clicked:
+        # Try button selectors directly
+        for sel in [
+            'button:has-text("Use your passkey")',
+            'button:has-text("passkey")',
+            '[role="button"]:has-text("passkey")',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.click(timeout=3000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if clicked:
+        await _hd(2, 3.5)
+        # After passkey prompt fails (we're headless, no security key), pick TOTP
+        await _click_text(page, [
+            "try another way", "طريقة أخرى", "جرب طريقة",
+            "use a different method", "use another method",
+        ], 5000)
+        await _hd(1.0, 2.0)
+        await _click_text(page, [
+            "google authenticator", "authenticator app", "code from your authenticator",
+            "تطبيق المصادقة", "مصادق Google", "Google Authenticator", "verification code",
+        ], 4000)
+        await _hd(1.0, 2.0)
+    return clicked
+
+
 async def _switch_to_totp_method(page) -> bool:
+    """Handle device-tap, passkey, and other 2FA prompts to land on TOTP input."""
+    # Passkey screen first
+    if await _handle_passkey_screen(page):
+        return True
+
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
@@ -608,6 +668,51 @@ async def _do_login(page_holder: Dict[str, Any], gmail: str, old_password: str,
 # Change password / setup new authenticator / verify
 # ---------------------------------------------------------------------------
 
+async def _click_change_password_button(page) -> bool:
+    """Try multiple strategies to click the 'Change password' button reliably.
+
+    Google sometimes renders this button as <button>, sometimes as a div with
+    role=button, and the visible text varies (Change password / تغيير / Save).
+    We try locators in order and return on first success.
+    """
+    # Strategy 1: button with exact visible text (English)
+    selectors = [
+        'button:has-text("Change password")',
+        'button:has-text("Change Password")',
+        'button:has-text("تغيير كلمة المرور")',
+        'button:has-text("Save")',
+        '[role="button"]:has-text("Change password")',
+        '[role="button"]:has-text("تغيير كلمة المرور")',
+        # Google's Material button class fallback
+        'button[jsname]:has-text("Change")',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                # Scroll into view first (the button can be below fold)
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                log.info("Clicked change-password button via: %s", sel)
+                return True
+        except Exception as exc:
+            log.debug("Selector %s failed: %s", sel, exc)
+            continue
+
+    # Strategy 2: text-based xpath (case-insensitive)
+    if await _click_text(page, [
+        "change password", "تغيير كلمة المرور", "تغيير كلمة السر", "save", "حفظ",
+    ], 5000):
+        log.info("Clicked change-password button via text search")
+        return True
+
+    return False
+
+
 async def _change_password(page, on_progress: ProgressCallback) -> str:
     await on_progress("step:open_security_page")
     new_pwd = _generate_strong_password(16)
@@ -633,27 +738,67 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
     if n < 2:
         raise RuntimeError("حقول كلمة السر الجديدة غير ظاهرة")
 
+    # Fill new password (field #1)
     await fields.nth(0).click()
     await _hd(0.2, 0.5)
-    await page.keyboard.type(new_pwd, delay=60)
+    await page.keyboard.type(new_pwd, delay=random.randint(40, 90))
     await _hd(0.4, 0.9)
+    # Confirm new password (field #2)
     await fields.nth(1).click()
     await _hd(0.2, 0.5)
-    await page.keyboard.type(new_pwd, delay=60)
-    await _hd(0.4, 0.9)
+    await page.keyboard.type(new_pwd, delay=random.randint(40, 90))
+    await _hd(0.6, 1.2)
 
-    if not await _click_text(page, ["change password", "save", "تغيير كلمة المرور", "حفظ"], 4000):
-        await page.keyboard.press("Enter")
+    # Tab out so Google validates the strength meter
+    try:
+        await page.keyboard.press("Tab")
+    except Exception:
+        pass
+    await _hd(0.8, 1.6)
+
+    # Click "Change password" — try several strategies
+    clicked = await _click_change_password_button(page)
+    if not clicked:
+        # Last-resort: focus confirm field and press Enter
+        try:
+            await fields.nth(1).click()
+            await _hd(0.2, 0.4)
+            await page.keyboard.press("Enter")
+            log.info("Submitted via Enter key (fallback)")
+        except Exception as exc:
+            raise RuntimeError(f"تعذّر الضغط على زر Change password: {exc}")
+
+    # Wait for the page to react (URL change / success banner)
     await _hd(3, 5)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        pass
 
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
         body = ""
-    if any(k in body for k in ["password changed", "تم تغيير", "تم الحفظ"]):
+    if any(k in body for k in [
+        "password changed", "password was changed", "تم تغيير", "تم الحفظ",
+    ]):
+        log.info("Password change confirmed via banner")
+        return new_pwd
+    if "/signinoptions/password" not in page.url:
+        log.info("Password change confirmed via URL change: %s", page.url)
+        return new_pwd
+
+    # One more wait + recheck — Google sometimes shows banner late
+    await _hd(2, 3)
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if any(k in body for k in ["password changed", "password was changed", "تم تغيير"]):
         return new_pwd
     if "/signinoptions/password" not in page.url:
         return new_pwd
+
     raise RuntimeError("تعذّر تأكيد تغيير كلمة السر")
 
 
@@ -711,6 +856,8 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
 
 async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
                           on_progress: ProgressCallback) -> bool:
+    """Sign out, sign back in with the new credentials, and confirm 2FA works
+    without any user interaction. Handles passkey/device-tap automatically."""
     await on_progress("step:verify_new_2fa")
     try:
         await page.goto("https://accounts.google.com/Logout",
@@ -742,40 +889,83 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
     except Exception:
         pass
 
-    pwd_loc = await _wait_for_visible_locator(
-        page,
-        [
-            'input[type="password"][name="Passwd"]',
-            'input[type="password"]:not([name="hiddenPassword"]):not([aria-hidden="true"]):not([tabindex="-1"])',
-            'input[type="password"]',
-        ],
-        timeout_ms=30_000,
-    )
-    await pwd_loc.click()
-    await _hd(0.3, 0.8)
-    await pwd_loc.type(new_password, delay=random.randint(30, 90))
-    pwd_next = page.locator("#passwordNext").first
-    if await pwd_next.count() == 0:
-        pwd_next = page.get_by_role("button", name="Next")
-    if await pwd_next.count() > 0:
-        await pwd_next.click()
-    else:
-        await page.keyboard.press("Enter")
-    await _hd(2.5, 4)
-
-    await _switch_to_totp_method(page)
+    # After email, Google may go directly to passkey / 2FA without showing a
+    # password field (if account is passwordless). Check first.
     code_sel = (
         'input[type="tel"], input#totpPin, input[name="totpPin"], '
         'input[autocomplete="one-time-code"]'
     )
+
+    # Try password field first (normal flow)
     try:
-        await page.wait_for_selector(code_sel, timeout=15_000, state="visible")
+        pwd_loc = await _wait_for_visible_locator(
+            page,
+            [
+                'input[type="password"][name="Passwd"]',
+                'input[type="password"]:not([name="hiddenPassword"]):not([aria-hidden="true"]):not([tabindex="-1"])',
+                'input[type="password"]',
+            ],
+            timeout_ms=10_000,
+        )
+        await pwd_loc.click()
+        await _hd(0.3, 0.8)
+        await pwd_loc.type(new_password, delay=random.randint(30, 90))
+        pwd_next = page.locator("#passwordNext").first
+        if await pwd_next.count() == 0:
+            pwd_next = page.get_by_role("button", name="Next")
+        if await pwd_next.count() > 0:
+            await pwd_next.click()
+        else:
+            await page.keyboard.press("Enter")
+        await _hd(2.5, 4)
     except Exception:
-        return True
-    await _type_human_at(page, code_sel, _now_totp(new_secret))
-    await page.keyboard.press("Enter")
-    await _hd(2, 4)
-    return "myaccount" in page.url or "signin" not in page.url
+        # No password field — Google may have jumped straight to passkey/2FA
+        log.info("No password field shown — proceeding to 2FA detection")
+
+    # Now handle whatever 2FA challenge appears: passkey, device-tap, or TOTP
+    # _switch_to_totp_method handles passkey + device-tap + try-another-way
+    await _switch_to_totp_method(page)
+
+    # Wait for TOTP input field
+    try:
+        await page.wait_for_selector(code_sel, timeout=20_000, state="visible")
+    except Exception:
+        # One more retry: maybe still on passkey screen
+        if await _switch_to_totp_method(page):
+            try:
+                await page.wait_for_selector(code_sel, timeout=15_000, state="visible")
+            except Exception:
+                # If we can't find TOTP input but URL says we're logged in, treat as success
+                cur = page.url
+                if "myaccount" in cur or ("signin" not in cur and "challenge" not in cur):
+                    log.info("Verify: no TOTP shown but URL looks logged-in (%s)", cur)
+                    return True
+                raise RuntimeError("لم يظهر حقل إدخال رمز Authenticator في التحقق")
+        else:
+            cur = page.url
+            if "myaccount" in cur or ("signin" not in cur and "challenge" not in cur):
+                return True
+            raise RuntimeError("لم يظهر حقل إدخال رمز Authenticator في التحقق")
+
+    # Auto-enter the TOTP code using the new secret
+    code = _now_totp(new_secret)
+    log.info("Auto-entering fresh TOTP code from new secret")
+    await _type_human_at(page, code_sel, code)
+    await _hd(0.4, 0.9)
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 3000):
+        await page.keyboard.press("Enter")
+    await _hd(3, 5)
+
+    # Skip "Stay signed in" / "save device" prompts so we land on myaccount
+    for label in ["not now", "ليس الآن", "skip", "تخطي"]:
+        if await _click_text(page, [label], 1500):
+            await _hd(0.6, 1.2)
+            break
+
+    cur = page.url
+    success = "myaccount" in cur or ("signin" not in cur and "challenge" not in cur)
+    log.info("Verify result: success=%s url=%s", success, cur)
+    return success
 
 
 # ---------------------------------------------------------------------------
