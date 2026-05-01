@@ -802,7 +802,76 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
     raise RuntimeError("تعذّر تأكيد تغيير كلمة السر")
 
 
-async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
+async def _click_turn_on_2sv(page) -> bool:
+    """Click 'Turn on 2-Step Verification' button if visible.
+
+    This appears when 2SV is currently OFF. After clicking, Google may
+    re-prompt for the password before continuing. We handle that too.
+    """
+    selectors = [
+        'button:has-text("Turn on 2-Step Verification")',
+        'button:has-text("Turn on")',
+        'button:has-text("تفعيل التحقّق")',
+        'button:has-text("تفعيل المصادقة")',
+        '[role="button"]:has-text("Turn on 2-Step")',
+        '[role="button"]:has-text("تفعيل")',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                log.info("Clicked 'Turn on 2-Step Verification' via: %s", sel)
+                return True
+        except Exception:
+            continue
+
+    if await _click_text(page, [
+        "turn on 2-step verification", "turn on 2-step", "turn on 2sv",
+        "تفعيل التحقّق بخطوتين", "تفعيل المصادقة الثنائية", "تفعيل التحقق",
+    ], 5000):
+        return True
+    return False
+
+
+async def _reauth_if_needed(page, current_password: str) -> None:
+    """If Google re-prompts for the password (common after clicking sensitive
+    settings buttons), fill it automatically using the password we just set."""
+    pwd_sel = (
+        'input[type="password"][name="Passwd"], '
+        'input[type="password"]:not([name="hiddenPassword"])'
+        ':not([aria-hidden="true"]):not([tabindex="-1"])'
+    )
+    try:
+        await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
+    except Exception:
+        return  # No re-auth needed
+    log.info("Re-auth prompt detected — entering current password")
+    try:
+        loc = page.locator(pwd_sel).first
+        await loc.click()
+        await _hd(0.3, 0.7)
+        await loc.type(current_password, delay=random.randint(40, 90))
+        await _hd(0.4, 0.8)
+        nxt = page.locator("#passwordNext").first
+        if await nxt.count() == 0:
+            nxt = page.get_by_role("button", name="Next")
+        if await nxt.count() > 0:
+            await nxt.click()
+        else:
+            await page.keyboard.press("Enter")
+        await _hd(2.5, 4)
+    except Exception as exc:
+        log.warning("Re-auth attempt failed: %s", exc)
+
+
+async def _setup_new_authenticator(page, on_progress: ProgressCallback,
+                                   current_password: str) -> str:
     await on_progress("step:open_2fa_settings")
     await page.goto(
         "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
@@ -810,18 +879,57 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
     )
     await _hd(2, 3.5)
 
-    await on_progress("step:enable_new_authenticator")
-    await _click_text(page, ["authenticator", "تطبيق المصادقة"], 5000)
+    # Re-auth may be required to open the 2SV settings page itself
+    await _reauth_if_needed(page, current_password)
     await _hd(1.5, 2.5)
+
+    # Step 1: If 2SV is currently OFF, turn it on first
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    needs_turn_on = any(kw in body for kw in [
+        "turn on 2-step verification", "turn on 2-step", "تفعيل التحقّق",
+        "تفعيل المصادقة الثنائية", "تفعيل التحقق",
+    ])
+    if needs_turn_on:
+        log.info("2SV is OFF — clicking 'Turn on 2-Step Verification'")
+        if await _click_turn_on_2sv(page):
+            await _hd(2, 3.5)
+            # Google may re-prompt for password after clicking
+            await _reauth_if_needed(page, current_password)
+            await _hd(1.5, 2.5)
+            # Skip phone-number / Google-prompt setup wizards
+            for label in [
+                "skip", "تخطي", "not now", "ليس الآن", "later", "لاحقاً",
+                "use another method", "use a different method",
+            ]:
+                if await _click_text(page, [label], 1500):
+                    await _hd(0.6, 1.2)
+        else:
+            log.warning("Could not find 'Turn on 2-Step Verification' button")
+
+    await on_progress("step:enable_new_authenticator")
+
+    # Step 2: Open the Authenticator section
     await _click_text(page, [
-        "set up authenticator", "set up", "+ add authenticator",
-        "get started", "إعداد", "بدء",
+        "authenticator app", "authenticator", "add authenticator app",
+        "تطبيق المصادقة", "إضافة تطبيق المصادقة",
     ], 5000)
     await _hd(1.5, 2.5)
 
+    # Step 3: Click "Set up authenticator" / "Get started" / "+ Add"
+    await _click_text(page, [
+        "set up authenticator", "set up", "+ add authenticator",
+        "get started", "إعداد", "بدء", "إضافة",
+    ], 5000)
+    await _hd(1.5, 2.5)
+
+    # Step 4: Reveal the secret key (instead of scanning QR)
     revealed = await _click_text(page, [
-        "can't scan it", "can’t scan it", "can't scan", "لا يمكنك المسح",
-        "show secret", "show key",
+        "can't scan it", "can’t scan it", "can't scan", "cannot scan",
+        "لا يمكنك المسح", "show secret", "show key",
+        "set up without a qr code", "without a qr",
     ], 5000)
     await _hd(1.0, 2.0)
 
@@ -835,7 +943,21 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback) -> str:
         except Exception:
             pass
     if not secret:
+        # Fallback: try reading any visible text element that looks like a base32 chunk
+        try:
+            chunks = await page.locator("xpath=//*[contains(text(),' ')]").all_text_contents()
+            for c in chunks:
+                m = re.search(r"\b([A-Z2-7]{4}\s[A-Z2-7]{4}(?:\s[A-Z2-7]{4}){2,})\b", c.upper())
+                if m:
+                    secret = m.group(1).replace(" ", "").upper()
+                    break
+        except Exception:
+            pass
+
+    if not secret:
         raise RuntimeError("تعذّر استخراج مفتاح Authenticator الجديد من Google")
+
+    log.info("Extracted new TOTP secret (len=%d)", len(secret))
 
     await _click_text(page, ["next", "التالي"], 5000)
     await _hd(1.0, 2.0)
@@ -1050,7 +1172,7 @@ async def rotate_google_account(
         new_password = await _change_password(page, _progress_wrap)
         result["new_password"] = new_password
 
-        new_secret = await _setup_new_authenticator(page, _progress_wrap)
+        new_secret = await _setup_new_authenticator(page, _progress_wrap, new_password)
         result["new_totp_secret"] = new_secret
 
         await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap)
