@@ -668,6 +668,88 @@ async def _do_login(page_holder: Dict[str, Any], gmail: str, old_password: str,
 # Change password / setup new authenticator / verify
 # ---------------------------------------------------------------------------
 
+async def _confirm_change_password_dialog(page) -> bool:
+    """Click the 'Change password' button inside Google's confirmation dialog.
+
+    After clicking the first 'Change password' button, Google shows a modal
+    dialog ("You'll stay signed in on these devices after changing your
+    password") with two buttons: 'Cancel' and 'Change password'. We need
+    to click the second one to actually commit the change.
+    """
+    # Wait briefly for the dialog to appear
+    dialog_indicators = [
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        'div[aria-modal="true"]',
+    ]
+    dialog_found = False
+    for sel in dialog_indicators:
+        try:
+            await page.wait_for_selector(sel, timeout=3000, state="visible")
+            dialog_found = True
+            log.info("Confirmation dialog detected: %s", sel)
+            break
+        except Exception:
+            continue
+
+    if not dialog_found:
+        # Maybe Google submitted directly without a dialog — that's fine
+        log.info("No confirmation dialog appeared (may have submitted directly)")
+        return False
+
+    await _hd(0.5, 1.2)
+
+    # Try to click "Change password" inside the dialog specifically
+    dialog_button_selectors = [
+        '[role="dialog"] button:has-text("Change password")',
+        '[role="alertdialog"] button:has-text("Change password")',
+        'div[aria-modal="true"] button:has-text("Change password")',
+        '[role="dialog"] button:has-text("تغيير كلمة المرور")',
+        '[role="dialog"] [role="button"]:has-text("Change password")',
+        '[role="dialog"] button:has-text("Change Password")',
+    ]
+    for sel in dialog_button_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                log.info("Clicked dialog 'Change password' via: %s", sel)
+                return True
+        except Exception as exc:
+            log.debug("Dialog selector %s failed: %s", sel, exc)
+            continue
+
+    # Fallback: scope to dialog then text-search inside it
+    try:
+        dlg = page.locator('[role="dialog"], [role="alertdialog"], div[aria-modal="true"]').first
+        # Look for any button inside the dialog whose text matches
+        btns = dlg.locator('button, [role="button"]')
+        count = await btns.count()
+        for i in range(count):
+            btn = btns.nth(i)
+            try:
+                if not await btn.is_visible():
+                    continue
+                txt = (await btn.inner_text()).strip().lower()
+                if any(kw in txt for kw in [
+                    "change password", "change", "تغيير", "ok", "confirm", "تأكيد",
+                ]):
+                    # Skip cancel buttons
+                    if "cancel" in txt or "إلغاء" in txt:
+                        continue
+                    await btn.click(timeout=4000)
+                    log.info("Clicked dialog button via text scan: %r", txt)
+                    return True
+            except Exception:
+                continue
+    except Exception as exc:
+        log.warning("Dialog text-scan failed: %s", exc)
+
+    log.warning("Could not find 'Change password' button inside dialog")
+    return False
+
+
 async def _click_change_password_button(page) -> bool:
     """Try multiple strategies to click the 'Change password' button reliably.
 
@@ -767,6 +849,12 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
             log.info("Submitted via Enter key (fallback)")
         except Exception as exc:
             raise RuntimeError(f"تعذّر الضغط على زر Change password: {exc}")
+
+    # Google now shows a confirmation DIALOG ("You'll stay signed in on these
+    # devices...") that has its own "Change password" button. We must click it
+    # too, otherwise the password won't actually be changed.
+    await _hd(1.5, 2.5)
+    await _confirm_change_password_dialog(page)
 
     # Wait for the page to react (URL change / success banner)
     await _hd(3, 5)
