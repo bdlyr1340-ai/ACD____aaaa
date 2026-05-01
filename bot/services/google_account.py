@@ -35,7 +35,7 @@ CredentialsCallback = Callable[[str, str], Awaitable[None]]  # (label, value) ->
 
 # Default fixed values (override via env vars)
 DEFAULT_NEW_PASSWORD = "VJ77X2305xx30j5"
-DEFAULT_FALLBACK_PHONE = "07728257333"
+DEFAULT_FALLBACK_PHONE = "+9647728257333"
 
 
 async def _shoot(page, user_id: int, tag: str,
@@ -1054,7 +1054,24 @@ async def _add_phone_number(page, phone: str,
     phone_loc = page.locator(phone_sel).first
     await phone_loc.click()
     await _hd(0.3, 0.7)
-    await phone_loc.type(phone, delay=random.randint(40, 90))
+
+    # Clean the phone string: keep only digits and a leading '+'.
+    # Google's phone field expects either "+9647728257333" or "07728257333"
+    # (with a country selected). Spaces or dashes break the parser.
+    cleaned = phone.strip()
+    if cleaned.startswith("+"):
+        cleaned = "+" + re.sub(r"\D", "", cleaned)
+    else:
+        cleaned = re.sub(r"\D", "", cleaned)
+    log.info("Typing cleaned phone: %s", cleaned)
+
+    # Clear any pre-filled value first
+    try:
+        await phone_loc.fill("")
+        await _hd(0.2, 0.4)
+    except Exception:
+        pass
+    await phone_loc.type(cleaned, delay=random.randint(40, 90))
     await _hd(0.5, 1.2)
 
     # Submit phone number
@@ -1137,8 +1154,9 @@ async def _setup_new_authenticator(
     await _reauth_if_needed(page, current_password)
     await _hd(1.5, 2.5)
 
-    # Default phone is hard-coded but can be overridden via env var
-    phone_to_add = os.environ.get("FALLBACK_PHONE", "07728257333").strip()
+    # Default phone is hard-coded but can be overridden via env var.
+    # Use international format (+964...) for Iraqi numbers — Google requires it.
+    phone_to_add = os.environ.get("FALLBACK_PHONE", "+9647728257333").strip()
 
     # Step 1: If 2SV is currently OFF, try to turn it on
     async def _read_body() -> str:
