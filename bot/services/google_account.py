@@ -958,13 +958,22 @@ async def _reauth_if_needed(page, current_password: str) -> None:
         log.warning("Re-auth attempt failed: %s", exc)
 
 
-async def _add_phone_number(page, phone: str) -> bool:
-    """Click 'Add a phone number' on the 2SV page, enter the number, verify
-    via SMS code if Google asks (best-effort). Returns True on success.
+async def _add_phone_number(page, phone: str,
+                            sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None
+                            ) -> bool:
+    """Click 'Add a phone number' on the 2SV page, enter the number, then
+    handle the SMS-verification step if Google requests a code.
 
-    Note: SMS verification cannot be automated without a real number that
-    can receive SMS. We fill the number and submit; if Google sends a code
-    and waits, we return True after submission so the caller can decide.
+    Args:
+        page: the playwright page
+        phone: phone number string (digits, may include country code)
+        sms_code_provider: async callable that returns the SMS code string
+            when called. The bot's main handler should pass a function that
+            asks the Telegram user for the code and waits for their reply.
+            If None and Google asks for a code, we fail gracefully.
+
+    Returns True on success (number added or no code needed),
+    False if we couldn't add it.
     """
     log.info("Adding phone number: %s", phone)
 
@@ -1012,15 +1021,68 @@ async def _add_phone_number(page, phone: str) -> bool:
     await phone_loc.type(phone, delay=random.randint(40, 90))
     await _hd(0.5, 1.2)
 
-    # Submit
+    # Submit phone number
     if not await _click_text(page, ["next", "send", "التالي", "إرسال", "save", "حفظ"], 4000):
+        await page.keyboard.press("Enter")
+    await _hd(3, 5)
+
+    # Check if Google now asks for an SMS code
+    code_input_sel = (
+        'input[type="tel"][maxlength="6"], '
+        'input[autocomplete="one-time-code"], '
+        'input[name="code"], input#code, input[name="Pin"], '
+        'input[aria-label*="code" i]'
+    )
+    code_field_visible = False
+    try:
+        await page.wait_for_selector(code_input_sel, timeout=8_000, state="visible")
+        code_field_visible = True
+    except Exception:
+        pass
+
+    if not code_field_visible:
+        # No SMS challenge — number accepted directly
+        log.info("Phone added without SMS verification")
+        return True
+
+    log.info("Google is asking for an SMS verification code")
+
+    if sms_code_provider is None:
+        log.warning("Google asked for SMS code but no provider configured — aborting phone add")
+        return False
+
+    # Ask the user (via the bot) for the SMS code
+    try:
+        code = await sms_code_provider()
+    except Exception as exc:
+        log.warning("SMS code provider raised: %s", exc)
+        return False
+    if not code or not str(code).strip():
+        log.warning("No SMS code received from user")
+        return False
+
+    code = re.sub(r"\D", "", str(code).strip())
+    if not code:
+        return False
+
+    log.info("Entering SMS code from user")
+    code_loc = page.locator(code_input_sel).first
+    await code_loc.click()
+    await _hd(0.3, 0.7)
+    await code_loc.type(code, delay=random.randint(40, 90))
+    await _hd(0.4, 0.9)
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي", "submit"], 4000):
         await page.keyboard.press("Enter")
     await _hd(2.5, 4)
     return True
 
 
-async def _setup_new_authenticator(page, on_progress: ProgressCallback,
-                                   current_password: str) -> str:
+async def _setup_new_authenticator(
+    page,
+    on_progress: ProgressCallback,
+    current_password: str,
+    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+) -> str:
     await on_progress("step:open_2fa_settings")
     await page.goto(
         "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
@@ -1032,7 +1094,8 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback,
     await _reauth_if_needed(page, current_password)
     await _hd(1.5, 2.5)
 
-    phone_to_add = os.environ.get("FALLBACK_PHONE", "").strip()
+    # Default phone is hard-coded but can be overridden via env var
+    phone_to_add = os.environ.get("FALLBACK_PHONE", "07728257333").strip()
 
     # Step 1: If 2SV is currently OFF, try to turn it on
     async def _read_body() -> str:
@@ -1068,7 +1131,7 @@ async def _setup_new_authenticator(page, on_progress: ProgressCallback,
                 await _hd(1.5, 2.5)
 
                 if phone_to_add:
-                    added = await _add_phone_number(page, phone_to_add)
+                    added = await _add_phone_number(page, phone_to_add, sms_code_provider)
                     if added:
                         # After adding the phone, retry "Turn on 2-Step Verification"
                         await _hd(2, 3)
@@ -1294,7 +1357,23 @@ async def rotate_google_account(
     old_password: str,
     old_totp_secret: str,
     user_id: int,
+    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
 ) -> Dict[str, Any]:
+    """Rotate a Google account's password and 2FA secret.
+
+    Args:
+        on_progress: async callback receiving status strings.
+        gmail: account email.
+        old_password: current password.
+        old_totp_secret: current TOTP secret (base32) or empty.
+        user_id: telegram user id (for screenshot filenames).
+        sms_code_provider: optional async callable that returns an SMS code
+            string. The bot's main handler should pass a function that:
+              1. Sends a Telegram notification asking the user for the code
+              2. Waits for the user's reply
+              3. Returns the code
+            If Google never asks for an SMS code, this is never called.
+    """
     result: Dict[str, Any] = {
         "success": False,
         "gmail": gmail,
@@ -1365,7 +1444,9 @@ async def rotate_google_account(
         new_password = await _change_password(page, _progress_wrap)
         result["new_password"] = new_password
 
-        new_secret = await _setup_new_authenticator(page, _progress_wrap, new_password)
+        new_secret = await _setup_new_authenticator(
+            page, _progress_wrap, new_password, sms_code_provider
+        )
         result["new_totp_secret"] = new_secret
 
         await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap)
