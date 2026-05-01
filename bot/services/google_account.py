@@ -130,15 +130,35 @@ async def _type_human(page, selector: str, text: str) -> None:
 
 
 async def _wait_for_visible_locator(page, selectors: List[str], timeout_ms: int = 20_000):
-    """Return the first visible locator from a list of selectors."""
+    """Return the first *truly visible* locator from a list of selectors.
+
+    FIX: نتجاهل الحقول المخفية التي ترسلها Google كفخّ
+    (hiddenPassword / aria-hidden / tabindex=-1) ونتحقق من كل المطابقات
+    وليس فقط `.first` لأن الحقل الحقيقي قد لا يكون أول واحد في DOM.
+    """
     deadline = time.time() + (timeout_ms / 1000.0)
     last_error = None
     while time.time() < deadline:
         for selector in selectors:
             try:
-                loc = page.locator(selector).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    return loc
+                loc_all = page.locator(selector)
+                n = await loc_all.count()
+                for i in range(n):
+                    cand = loc_all.nth(i)
+                    # تخطّى أي حقل وسمه Google كفخّ
+                    try:
+                        name = (await cand.get_attribute("name")) or ""
+                        aria = (await cand.get_attribute("aria-hidden")) or ""
+                        tab = (await cand.get_attribute("tabindex")) or ""
+                        if name == "hiddenPassword" or aria == "true" or tab == "-1":
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        if await cand.is_visible():
+                            return cand
+                    except Exception as exc:
+                        last_error = exc
             except Exception as exc:
                 last_error = exc
         await asyncio.sleep(0.25)
@@ -288,7 +308,7 @@ async def _do_login(page, gmail: str, old_password: str, old_totp_secret: str,
 
     email_loc = await _wait_for_visible_locator(
         page,
-        ['input[type="email"]:visible', 'input#identifierId:visible', 'input[type="email"]'],
+        ['input[type="email"]', 'input#identifierId'],
         timeout_ms=20_000,
     )
     await email_loc.click()
@@ -305,16 +325,21 @@ async def _do_login(page, gmail: str, old_password: str, old_totp_secret: str,
         await page.keyboard.press("Enter")
 
     await on_progress("step:google_login_password")
-    await _hd(3, 5)
+    # ننتظر شبكة هادئة لضمان تحميل صفحة كلمة السر بالكامل قبل البحث عن الحقل
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
+    await _hd(2.0, 3.5)
 
     pwd_loc = await _wait_for_visible_locator(
         page,
         [
-            'input[type="password"][name="Passwd"]:visible',
-            'input[type="password"]:not([aria-hidden="true"]):visible',
-            'input[type="password"]:visible',
+            'input[type="password"][name="Passwd"]',
+            'input[type="password"]:not([name="hiddenPassword"]):not([aria-hidden="true"]):not([tabindex="-1"])',
+            'input[type="password"]',
         ],
-        timeout_ms=20_000,
+        timeout_ms=30_000,
     )
     await pwd_loc.click()
     await _hd(0.3, 0.8)
@@ -528,7 +553,7 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
 
     email_loc = await _wait_for_visible_locator(
         page,
-        ['input[type="email"]:visible', 'input#identifierId:visible', 'input[type="email"]'],
+        ['input[type="email"]', 'input#identifierId'],
         timeout_ms=20_000,
     )
     await email_loc.click()
@@ -543,14 +568,18 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
         await page.keyboard.press("Enter")
 
     await _hd(2, 3)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
     pwd_loc = await _wait_for_visible_locator(
         page,
         [
-            'input[type="password"][name="Passwd"]:visible',
-            'input[type="password"]:not([aria-hidden="true"]):visible',
-            'input[type="password"]:visible',
+            'input[type="password"][name="Passwd"]',
+            'input[type="password"]:not([name="hiddenPassword"]):not([aria-hidden="true"]):not([tabindex="-1"])',
+            'input[type="password"]',
         ],
-        timeout_ms=20_000,
+        timeout_ms=30_000,
     )
     await pwd_loc.click()
     await _hd(0.3, 0.8)
