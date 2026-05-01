@@ -1,72 +1,46 @@
-# 🛠️ إصلاح خطأ "Couldn't sign you in" + Timeout على input[password]
+# 🛠️ حزمة استرجاع البوت - النسخة العاملة
 
-## المشكلتان
-1. **Google يرفض المتصفح** ويعرض شاشة *"This browser or app may not be secure"* — السبب: Playwright Chromium الافتراضي يُكتشف بسهولة + IP السيرفر (Railway) محظور.
-2. **`Page.wait_for_selector` Timeout** — السيليكتور كان يلتقط `<input name="hiddenPasswor" aria-hidden="true">` (حقل مخفي) بدل حقل كلمة السر الحقيقي.
+## ما تم إصلاحه (سبب CRASHED على Railway)
 
-## الحل المُطبَّق في `bot/services/google_account.py`
+1. **`Dockerfile`**: حذفنا `python -m camoufox fetch` — كان يفشل البناء لأن Camoufox لا يعمل بشكل موثوق على Railway slim images، وحجم التحميل ضخم.
+2. **`requirements.txt`**: حذفنا `camoufox[geoip]` لأن `bot/services/google_account.py` (النسخة الآمنة الحالية) **لا يستخدمه أصلاً** — كان مجرد ثقل زائد يُفشل التثبيت.
+3. **`HEALTHCHECK`**: حذفناه — كان يسبب إعادة تشغيل لانهائية حين يفشل `pgrep`.
+4. **`railway.json`**: قللنا `restartPolicyMaxRetries` من 10 إلى 5 لتجنب حلقات إعادة التشغيل الطويلة.
 
-### 1) محرك متصفح مضاد للكشف
-- **Camoufox** أولاً (يفعّل anti-detection حقيقي + بصمة Firefox)
-- **fallback** إلى `playwright + playwright-stealth` مع:
-  - UA حديث (Chrome 130 على Windows)
-  - حقن `navigator.webdriver = undefined`
-  - `--disable-blink-features=AutomationControlled`
-  - locale `en-US`
+## ✅ ما لم يتغير (المنطق نفسه)
 
-### 2) كاشف حظر مبكر
-دالة `_check_google_block()` تُستدعى بعد كل خطوة وترفع خطأ واضح فوراً (مع لقطة شاشة + HTML) بدل انتظار 20 ثانية.
+- `bot/services/google_account.py` — نفس النسخة الآمنة (Playwright + stealth + إصلاح hidden password).
+- `bot/handlers/*.py` و `bot/db/*` و `bot/main.py` — لم يُلمس شيء.
+- دعم بروكسي عبر `PROXY_LIST` لا يزال يعمل.
 
-### 3) سيليكتور كلمة السر مُصلَح
-```python
-'input[type="password"][name="Passwd"]:visible, '
-'input[type="password"][autocomplete="current-password"]:visible, '
-'input[type="password"]:visible:not([aria-hidden="true"]):not([name="hiddenPasswor"])'
-```
-يستثني صراحةً `hiddenPasswor` و `aria-hidden="true"`.
+## 🔑 المتغيرات المطلوبة على Railway
 
-### 4) دعم بروكسي residential
-متغير بيئي `PROXY_LIST` (مفصول بفواصل):
-```
-PROXY_LIST=http://user:pass@host1:8000,http://user:pass@host2:8000
-```
-البوت يختار واحداً عشوائياً لكل حساب.
-
-## التثبيت
-
-### 1) ضع الملف
-استبدل `bot/services/google_account.py` لديك بالملف الجديد من هذا الـ ZIP.
-
-### 2) أضف للـ `requirements.txt` (إن لم تكن موجودة):
-```
-camoufox[geoip]>=0.4.0
-playwright-stealth>=1.0.6
-pyotp>=2.9.0
-```
-
-### 3) ثبّت متصفح Camoufox مرة واحدة على السيرفر:
 ```bash
-python -m camoufox fetch
-playwright install chromium  # كـ fallback
+BOT_TOKEN=...
+ADMIN_IDS=123456789
+DATABASE_URL=postgresql://...
+# اختياري:
+PROXY_LIST=http://user:pass@host:port,...
+DEFAULT_CREDITS=3
+ROTATE_COST=1
 ```
 
-### 4) متغيرات البيئة الجديدة في Railway
-| المتغير | القيمة | إجباري؟ |
-|---|---|---|
-| `PROXY_LIST` | `http://user:pass@ip:port,http://user:pass@ip2:port2` | **مُوصى بشدة** |
-| `HEADLESS` | `true` | اختياري |
-| `DEVICE_TAP_WAIT_SEC` | `75` | اختياري |
-| `SHOTS_DIR` | `/tmp/shots` | اختياري |
+## 🗑️ احذف هذه المتغيرات من Railway (لم تعد مستخدمة)
 
-## ⚠️ تحذير مهم
-**بدون بروكسي residential سيستمر الحظر** على Railway/DigitalOcean/أي VPS. Google يحظر هذه الـ IPs على مستوى الشبكة قبل أن يصل الطلب لمرحلة فحص المتصفح. الكود الجديد سيرسل لك خطأ واضح:
 ```
-BLOCKED_BY_GOOGLE: Google رفض المتصفح ('Couldn't sign you in').
-السبب الأرجح: IP السيرفر محظور. الحل: أضف PROXY_LIST residential.
+USE_CAMOUFOX
+USE_STEALTH
+CAMOUFOX_GEOIP
+MAX_RETRIES_ON_BLOCK
+NO_PROXY
+BROWSERLESS_PROXY
 ```
 
-## مزودو بروكسي residential مُجرَّبون
-- BrightData
-- Smartproxy
-- IPRoyal
-- Oxylabs
+## 🚀 خطوات التطبيق
+
+1. ارفع محتوى هذه الحزمة على GitHub (استبدل الملفات).
+2. على Railway: امسح المتغيرات المذكورة أعلاه.
+3. اضغط **Redeploy**.
+4. راقب Logs — يجب أن ترى `Bot connected: @YourBotName`.
+
+إذا ظهر أي خطأ جديد، انسخ آخر 30 سطر من Logs وأرسلها لي.
