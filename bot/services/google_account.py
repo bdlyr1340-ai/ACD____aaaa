@@ -1051,19 +1051,102 @@ async def _add_phone_number(page, phone: str,
         log.warning("Phone input field not visible")
         return False
 
+    # ── Try to select the country (Iraq) explicitly ──
+    # Google shows a country selector dropdown next to the phone input.
+    # If the default isn't Iraq, the +964 number will be rejected.
+    # We try multiple strategies:
+    country_iso = os.environ.get("PHONE_COUNTRY_ISO", "iq").lower().strip()
+    country_name = os.environ.get("PHONE_COUNTRY_NAME", "Iraq").strip()
+    country_dial = os.environ.get("PHONE_COUNTRY_DIAL", "+964").strip()
+
+    selected = False
+    try:
+        # Strategy A: open the country dropdown by clicking it
+        dropdown_selectors = [
+            'div[aria-label*="country" i][role="combobox"]',
+            'div[role="combobox"][aria-haspopup="listbox"]',
+            'button[aria-label*="country" i]',
+            'div[aria-label*="Country" i]',
+            'div[jsname][role="listbox"]',
+        ]
+        for dsel in dropdown_selectors:
+            try:
+                dd = page.locator(dsel).first
+                if await dd.count() and await dd.is_visible():
+                    await dd.click(timeout=3000)
+                    await _hd(0.6, 1.2)
+                    log.info("Opened country dropdown via: %s", dsel)
+                    # Type "Iraq" to filter, then press Enter
+                    try:
+                        await page.keyboard.type(country_name, delay=80)
+                        await _hd(0.5, 1.0)
+                    except Exception:
+                        pass
+                    # Try clicking the Iraq option
+                    iraq_option_selectors = [
+                        f'[role="option"]:has-text("{country_name}")',
+                        f'li:has-text("{country_name}")',
+                        f'div[role="option"]:has-text("{country_dial}")',
+                        f'[role="option"]:has-text("{country_dial}")',
+                    ]
+                    for opt_sel in iraq_option_selectors:
+                        try:
+                            opt = page.locator(opt_sel).first
+                            if await opt.count() and await opt.is_visible():
+                                await opt.click(timeout=2500)
+                                selected = True
+                                log.info("Selected country '%s' via: %s", country_name, opt_sel)
+                                break
+                        except Exception:
+                            continue
+                    if not selected:
+                        # Fallback: press Enter to pick first filtered result
+                        try:
+                            await page.keyboard.press("Enter")
+                            selected = True
+                            log.info("Selected country via Enter on filtered list")
+                        except Exception:
+                            pass
+                    break
+            except Exception:
+                continue
+        if not selected:
+            log.info("Country dropdown not found or not needed — proceeding with raw phone")
+    except Exception as exc:
+        log.warning("Country selection step failed (non-fatal): %s", exc)
+
+    await _hd(0.8, 1.5)
+
+    # Re-acquire the phone input (DOM may have changed after dropdown selection)
+    try:
+        await page.wait_for_selector(phone_sel, timeout=5_000, state="visible")
+    except Exception:
+        pass
     phone_loc = page.locator(phone_sel).first
     await phone_loc.click()
     await _hd(0.3, 0.7)
 
-    # Clean the phone string: keep only digits and a leading '+'.
-    # Google's phone field expects either "+9647728257333" or "07728257333"
-    # (with a country selected). Spaces or dashes break the parser.
-    cleaned = phone.strip()
-    if cleaned.startswith("+"):
-        cleaned = "+" + re.sub(r"\D", "", cleaned)
+    # Clean the phone string. Two strategies:
+    # 1. If we successfully selected the country, type the LOCAL number only
+    #    (without country code) — e.g., "07728257333" or "7728257333"
+    # 2. If country selection failed, fall back to international format
+    #    "+9647728257333" and hope the field accepts it
+    raw = re.sub(r"\D", "", phone.strip())
+    if selected:
+        # Strip the country dial prefix if present (e.g., 964 → "")
+        dial_digits = re.sub(r"\D", "", country_dial)  # "964"
+        if dial_digits and raw.startswith(dial_digits):
+            local = raw[len(dial_digits):]
+        else:
+            local = raw
+        # Iraqi mobile numbers start with 07 → keep leading 0 for local format
+        # but only if the user provided it; otherwise let Google handle it.
+        cleaned = local.lstrip("0") if local.startswith("0") else local
+        # Some Google flows want a leading 0; try without first
+        log.info("Country selected — typing local number: %s", cleaned)
     else:
-        cleaned = re.sub(r"\D", "", cleaned)
-    log.info("Typing cleaned phone: %s", cleaned)
+        cleaned = ("+" + raw) if not phone.strip().startswith("+") else "+" + raw
+        log.info("No country selected — typing international: %s", cleaned)
 
     # Clear any pre-filled value first
     try:
