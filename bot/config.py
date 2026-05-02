@@ -37,7 +37,7 @@ BROWSERLESS_PROXY_COUNTRY: str = os.environ.get("BROWSERLESS_PROXY_COUNTRY", "us
 
 # ── Bulk processing ──
 MAX_BULK_ACCOUNTS: int = int(os.environ.get("MAX_BULK_ACCOUNTS", "30"))
-ROTATE_TIMEOUT_SEC: int = int(os.environ.get("ROTATE_TIMEOUT_SEC", "300"))
+ROTATE_TIMEOUT_SEC: int = int(os.environ.get("ROTATE_TIMEOUT_SEC", "900"))
 
 # ── Logging ──
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
