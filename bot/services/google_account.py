@@ -994,58 +994,76 @@ async def _reauth_if_needed(page, current_password: str) -> None:
         log.warning("Re-auth attempt failed: %s", exc)
 
 
-async def _add_phone_number(page, phone: str,
-                            sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None
-                            ) -> bool:
-    """Click 'Add a phone number' on the 2SV page, enter the number, then
-    handle the SMS-verification step if Google requests a code.
+async def _add_phone_number(
+    page,
+    phone: str,
+    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    *,
+    on_screenshot: Optional[ScreenshotCallback] = None,
+    user_id: int = 0,
+) -> bool:
+    """Click through Google's multi-step phone-add flow.
 
-    Args:
-        page: the playwright page
-        phone: phone number string (digits, may include country code)
-        sms_code_provider: async callable that returns the SMS code string
-            when called. The bot's main handler should pass a function that
-            asks the Telegram user for the code and waits for their reply.
-            If None and Google asks for a code, we fail gracefully.
+    Sequence (each step waits for visible-and-stable DOM before clicking):
+      A. "Add a phone number" row (in Second steps list)
+      B. "Add phone number" button (intermediate page, sometimes skipped)
+      C. "Enter phone number" entry-point (sometimes skipped)
+      D. Country dropdown → select Iraq
+      E. Phone input field → type the number
+      F. "Next" button → submit
+      G. (optional) Enter SMS code if Google asks
 
-    Returns True on success (number added or no code needed),
-    False if we couldn't add it.
+    Captures a screenshot after every sub-step (when on_screenshot is given)
+    so the user can see exactly where the flow stops.
     """
     log.info("Adding phone number: %s", phone)
 
-    # ── Step A: Click the "Add a phone number" ROW in Second steps ──
-    clicked = False
+    async def _snap(tag: str) -> None:
+        await _shoot(page, user_id, f"phone_{tag}", on_screenshot)
+
+    # ── Step A: click the "Add a phone number" row ──
+    await _snap("A0_before_click")
+    clicked_a = False
     for sel in [
-        'div:has-text("Add a phone number")',
+        '[role="link"]:has-text("Add a phone number")',
         '[role="button"]:has-text("Add a phone number")',
-        'button:has-text("Add a phone number")',
         'a:has-text("Add a phone number")',
+        'button:has-text("Add a phone number")',
+        'div:has-text("Add a phone number")',
+        'li:has-text("Add a phone number")',
     ]:
         try:
             loc = page.locator(sel).first
             if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
                 await loc.click(timeout=4000)
-                clicked = True
-                log.info("[A] Clicked 'Add a phone number' row via: %s", sel)
+                clicked_a = True
+                log.info("[A] Clicked 'Add a phone number' via: %s", sel)
                 break
         except Exception:
             continue
-    if not clicked:
-        clicked = await _click_text(page, [
+    if not clicked_a:
+        clicked_a = await _click_text(page, [
             "add a phone number", "إضافة رقم هاتف",
         ], 5000)
-    if not clicked:
-        log.warning("Could not click 'Add a phone number' row")
+    if not clicked_a:
+        log.warning("[A] FAILED: could not click 'Add a phone number'")
+        await _snap("A1_FAILED")
         return False
 
-    await _hd(2, 3.5)
+    await _hd(2.5, 4)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    await _snap("A2_after_click")
 
-    # ── Step B: Click the "Add phone number" BUTTON on the next page ──
-    # Google sometimes shows an intermediate page with a single "Add phone
-    # number" call-to-action button before opening the phone-entry form.
-    # We try to click it, but it's OK if it's not present (some flows skip).
+    # ── Step B: click the intermediate "Add phone number" button (best-effort) ──
     log.info("[B] Looking for intermediate 'Add phone number' button")
-    intermediate_clicked = False
     for sel in [
         'button:has-text("Add phone number")',
         '[role="button"]:has-text("Add phone number")',
@@ -1060,23 +1078,19 @@ async def _add_phone_number(page, phone: str,
                     pass
                 await _hd(0.3, 0.7)
                 await loc.click(timeout=4000)
-                intermediate_clicked = True
-                log.info("[B] Clicked intermediate 'Add phone number' button via: %s", sel)
+                log.info("[B] Clicked intermediate button via: %s", sel)
+                await _hd(2, 3.5)
+                await _snap("B_after_click")
                 break
         except Exception:
             continue
-    if intermediate_clicked:
-        await _hd(2, 3.5)
 
-    # ── Step C: Click "Enter phone number" if shown ──
-    # On some flows, Google shows a final "Enter phone number" entry point
-    # before the actual input field appears.
+    # ── Step C: click "Enter phone number" entry-point (best-effort) ──
     log.info("[C] Looking for 'Enter phone number' button")
-    enter_clicked = False
     for sel in [
         'button:has-text("Enter phone number")',
         '[role="button"]:has-text("Enter phone number")',
-        'div:has-text("Enter phone number")[role="button"]',
+        'div[role="button"]:has-text("Enter phone number")',
         'button:has-text("Enter a phone number")',
     ]:
         try:
@@ -1088,48 +1102,53 @@ async def _add_phone_number(page, phone: str,
                     pass
                 await _hd(0.3, 0.7)
                 await loc.click(timeout=4000)
-                enter_clicked = True
                 log.info("[C] Clicked 'Enter phone number' via: %s", sel)
+                await _hd(1.5, 2.5)
+                await _snap("C_after_click")
                 break
         except Exception:
             continue
-    if not enter_clicked:
-        # Text-search fallback (case-insensitive)
+    else:
         if await _click_text(page, ["enter phone number", "enter a phone number", "أدخل رقم الهاتف"], 3000):
-            enter_clicked = True
             log.info("[C] Clicked 'Enter phone number' via text search")
-    if enter_clicked:
-        await _hd(1.5, 2.5)
+            await _hd(1.5, 2.5)
+            await _snap("C_after_click_text")
 
-    # ── Step D: Wait for the actual phone-input field ──
+    # ── Step D: wait for the phone-input field with longer timeout ──
     log.info("[D] Waiting for phone input field")
     phone_sel = (
         'input[type="tel"], input[name="phoneNumber"], '
         'input[aria-label*="phone" i], input[autocomplete="tel"]'
     )
     try:
-        await page.wait_for_selector(phone_sel, timeout=12_000, state="visible")
+        await page.wait_for_selector(phone_sel, timeout=20_000, state="visible")
     except Exception:
-        log.warning("Phone input field not visible after all click steps")
+        log.warning("[D] FAILED: phone input field not visible after 20s")
+        await _snap("D_FAILED_no_input")
+        # Last resort: dump HTML so user can see what page Google is showing
+        try:
+            html = await page.content()
+            log.info("[D] Page HTML length: %d, URL: %s", len(html), page.url)
+        except Exception:
+            pass
         return False
+    await _snap("D_input_visible")
 
-    # ── Try to select the country (Iraq) explicitly ──
-    # Google shows a country selector dropdown next to the phone input.
-    # If the default isn't Iraq, the +964 number will be rejected.
-    # We try multiple strategies:
+    # ── Step E: select country (Iraq) — try aggressively ──
     country_iso = os.environ.get("PHONE_COUNTRY_ISO", "iq").lower().strip()
     country_name = os.environ.get("PHONE_COUNTRY_NAME", "Iraq").strip()
     country_dial = os.environ.get("PHONE_COUNTRY_DIAL", "+964").strip()
 
     selected = False
     try:
-        # Strategy A: open the country dropdown by clicking it
         dropdown_selectors = [
             'div[aria-label*="country" i][role="combobox"]',
             'div[role="combobox"][aria-haspopup="listbox"]',
             'button[aria-label*="country" i]',
             'div[aria-label*="Country" i]',
             'div[jsname][role="listbox"]',
+            # Fallback: any combobox near the phone input
+            '[role="combobox"]',
         ]
         for dsel in dropdown_selectors:
             try:
@@ -1137,14 +1156,12 @@ async def _add_phone_number(page, phone: str,
                 if await dd.count() and await dd.is_visible():
                     await dd.click(timeout=3000)
                     await _hd(0.6, 1.2)
-                    log.info("Opened country dropdown via: %s", dsel)
-                    # Type "Iraq" to filter, then press Enter
+                    log.info("[E] Opened country dropdown via: %s", dsel)
                     try:
                         await page.keyboard.type(country_name, delay=80)
                         await _hd(0.5, 1.0)
                     except Exception:
                         pass
-                    # Try clicking the Iraq option
                     iraq_option_selectors = [
                         f'[role="option"]:has-text("{country_name}")',
                         f'li:has-text("{country_name}")',
@@ -1157,29 +1174,29 @@ async def _add_phone_number(page, phone: str,
                             if await opt.count() and await opt.is_visible():
                                 await opt.click(timeout=2500)
                                 selected = True
-                                log.info("Selected country '%s' via: %s", country_name, opt_sel)
+                                log.info("[E] Selected country '%s' via: %s", country_name, opt_sel)
                                 break
                         except Exception:
                             continue
                     if not selected:
-                        # Fallback: press Enter to pick first filtered result
                         try:
                             await page.keyboard.press("Enter")
                             selected = True
-                            log.info("Selected country via Enter on filtered list")
+                            log.info("[E] Selected country via Enter on filtered list")
                         except Exception:
                             pass
                     break
             except Exception:
                 continue
         if not selected:
-            log.info("Country dropdown not found or not needed — proceeding with raw phone")
+            log.info("[E] Country dropdown not found — using international format")
     except Exception as exc:
-        log.warning("Country selection step failed (non-fatal): %s", exc)
+        log.warning("[E] Country selection failed (non-fatal): %s", exc)
+    await _snap("E_after_country")
 
     await _hd(0.8, 1.5)
 
-    # Re-acquire the phone input (DOM may have changed after dropdown selection)
+    # Re-acquire phone input (DOM may have changed)
     try:
         await page.wait_for_selector(phone_sel, timeout=5_000, state="visible")
     except Exception:
@@ -1188,43 +1205,37 @@ async def _add_phone_number(page, phone: str,
     await phone_loc.click()
     await _hd(0.3, 0.7)
 
-    # Clean the phone string. Two strategies:
-    # 1. If we successfully selected the country, type the LOCAL number only
-    #    (without country code) — e.g., "07728257333" or "7728257333"
-    # 2. If country selection failed, fall back to international format
-    #    "+9647728257333" and hope the field accepts it
+    # Build phone string — country selected → local number, else international
     raw = re.sub(r"\D", "", phone.strip())
     if selected:
-        # Strip the country dial prefix if present (e.g., 964 → "")
         dial_digits = re.sub(r"\D", "", country_dial)  # "964"
         if dial_digits and raw.startswith(dial_digits):
             local = raw[len(dial_digits):]
         else:
             local = raw
-        # Iraqi mobile numbers start with 07 → keep leading 0 for local format
-        # but only if the user provided it; otherwise let Google handle it.
         cleaned = local.lstrip("0") if local.startswith("0") else local
-        # Some Google flows want a leading 0; try without first
-        log.info("Country selected — typing local number: %s", cleaned)
+        log.info("[F] Country selected — typing local: %s", cleaned)
     else:
         cleaned = ("+" + raw) if not phone.strip().startswith("+") else "+" + raw
-        log.info("No country selected — typing international: %s", cleaned)
+        log.info("[F] No country — typing international: %s", cleaned)
 
-    # Clear any pre-filled value first
     try:
         await phone_loc.fill("")
         await _hd(0.2, 0.4)
     except Exception:
         pass
     await phone_loc.type(cleaned, delay=random.randint(40, 90))
-    await _hd(0.5, 1.2)
+    await _hd(0.6, 1.2)
+    await _snap("F_after_typing")
 
-    # Submit phone number
+    # ── Step F: click Next ──
     if not await _click_text(page, ["next", "send", "التالي", "إرسال", "save", "حفظ"], 4000):
         await page.keyboard.press("Enter")
+    log.info("[F] Submitted phone number")
     await _hd(3, 5)
+    await _snap("F_after_submit")
 
-    # Check if Google now asks for an SMS code
+    # ── Step G: handle SMS code if requested ──
     code_input_sel = (
         'input[type="tel"][maxlength="6"], '
         'input[autocomplete="one-time-code"], '
@@ -1239,31 +1250,30 @@ async def _add_phone_number(page, phone: str,
         pass
 
     if not code_field_visible:
-        # No SMS challenge — number accepted directly
-        log.info("Phone added without SMS verification")
+        log.info("[G] Phone added without SMS verification")
         return True
 
-    log.info("Google is asking for an SMS verification code")
+    log.info("[G] Google is asking for an SMS verification code")
+    await _snap("G_sms_requested")
 
     if sms_code_provider is None:
-        log.warning("Google asked for SMS code but no provider configured — aborting phone add")
+        log.warning("[G] No SMS provider configured — aborting")
         return False
 
-    # Ask the user (via the bot) for the SMS code
     try:
         code = await sms_code_provider()
     except Exception as exc:
-        log.warning("SMS code provider raised: %s", exc)
+        log.warning("[G] SMS code provider raised: %s", exc)
         return False
     if not code or not str(code).strip():
-        log.warning("No SMS code received from user")
+        log.warning("[G] No SMS code received from user")
         return False
 
     code = re.sub(r"\D", "", str(code).strip())
     if not code:
         return False
 
-    log.info("Entering SMS code from user")
+    log.info("[G] Entering SMS code")
     code_loc = page.locator(code_input_sel).first
     await code_loc.click()
     await _hd(0.3, 0.7)
@@ -1272,6 +1282,7 @@ async def _add_phone_number(page, phone: str,
     if not await _click_text(page, ["verify", "next", "تحقق", "التالي", "submit"], 4000):
         await page.keyboard.press("Enter")
     await _hd(2.5, 4)
+    await _snap("G_after_code")
     return True
 
 
@@ -1334,7 +1345,10 @@ async def _setup_new_authenticator(
         log.info("Adding phone number proactively BEFORE turning on 2SV")
         await on_progress("step:add_phone_number")
         try:
-            added = await _add_phone_number(page, phone_to_add, sms_code_provider)
+            added = await _add_phone_number(
+                page, phone_to_add, sms_code_provider,
+                on_screenshot=on_screenshot, user_id=user_id,
+            )
             await _snap("after_proactive_add_phone")
             if added:
                 # Reload 2SV page to refresh state
@@ -1413,7 +1427,10 @@ async def _setup_new_authenticator(
 
                 if phone_to_add:
                     await on_progress("step:add_phone_number")
-                    added = await _add_phone_number(page, phone_to_add, sms_code_provider)
+                    added = await _add_phone_number(
+                        page, phone_to_add, sms_code_provider,
+                        on_screenshot=on_screenshot, user_id=user_id,
+                    )
                     await _snap("after_add_phone_number")
                     if added:
                         await _hd(2, 3)
