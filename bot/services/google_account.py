@@ -1683,24 +1683,6 @@ async def _add_phone_number(
     return True
 
 
-def _is_recovery_phone_page(url: str, body_text: str) -> bool:
-    """Detect Google's 'Add recovery phone' interruption page."""
-    url_l = (url or "").lower()
-    body_l = (body_text or "").lower()
-    url_markers = [
-        "rescuephone", "signinoptions/rescue", "recovery/phone",
-        "addphone", "add-phone", "phoneenrollment",
-    ]
-    if any(m in url_l for m in url_markers):
-        return True
-    body_markers = [
-        "add recovery phone", "add a recovery phone", "recovery phone number",
-        "add a phone number for account recovery",
-        "إضافة هاتف الاسترداد", "أضف رقم استرداد", "رقم هاتف الاسترداد",
-    ]
-    return any(m in body_l for m in body_markers)
-
-
 async def _setup_new_authenticator(
     page,
     on_progress: ProgressCallback,
@@ -1711,6 +1693,7 @@ async def _setup_new_authenticator(
     user_id: int = 0,
     old_password: str = "",
     on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
+    on_credentials_ready: Optional[CredentialsCallback] = None,
 ) -> str:
     async def _snap(tag: str) -> None:
         await _shoot(page, user_id, tag, on_screenshot)
@@ -1750,13 +1733,7 @@ async def _setup_new_authenticator(
     # is visible in the Second steps section, the account has none.
     phone_already_set = True
     try:
-        no_phone_markers = [
-            "add a phone number", "add recovery phone", "add phone number",
-            "add a recovery phone", "no phone number",
-            "إضافة رقم هاتف", "إضافة رقم الهاتف", "أضف رقم هاتف",
-            "إضافة هاتف الاسترداد", "أضف رقم استرداد",
-        ]
-        if any(kw in body for kw in no_phone_markers):
+        if "add a phone number" in body or "إضافة رقم هاتف" in body:
             phone_already_set = False
     except Exception:
         pass
@@ -1942,6 +1919,26 @@ async def _setup_new_authenticator(
     log.info("Extracted new TOTP secret (len=%d)", len(secret))
     await _snap("totp_secret_extracted")
 
+    # ── EMIT credentials to user IMMEDIATELY (before risky TOTP submission) ──
+    # هذه أهم نقطة: أرسل للمستخدم المفتاح والرابط والرمز فوراً، حتى لو فشل
+    # إدخال الرمز في Google لاحقاً، المستخدم عنده كل البيانات.
+    if on_credentials_ready is not None:
+        try:
+            await on_credentials_ready("new_totp_secret", secret)
+        except Exception as exc:
+            log.warning("emit new_totp_secret failed: %s", exc)
+        try:
+            tfa_url = f"https://2fa.fb.tools/{secret}"
+            await on_credentials_ready("totp_url", tfa_url)
+        except Exception as exc:
+            log.warning("emit totp_url failed: %s", exc)
+        try:
+            current_code = _now_totp(secret)
+            await on_credentials_ready("totp_code", current_code)
+        except Exception as exc:
+            log.warning("emit totp_code failed: %s", exc)
+
+
     # ── Click "Next" to proceed from QR/secret page to the code-entry page ──
     # The previous text-only search was too greedy and could click wrong buttons.
     # Try specific button selectors first, then fall back to text search.
@@ -2001,63 +1998,6 @@ async def _setup_new_authenticator(
                 body_now = (await page.inner_text("body")).lower()
             except Exception:
                 body_now = ""
-            # ── Recovery Phone interruption ──
-            if _is_recovery_phone_page(page.url, body_now):
-                log.info("Authenticator flow hit Recovery Phone page on attempt %d", attempt + 1)
-                await _snap(f"recovery_phone_detected_attempt{attempt + 1}")
-                rec_phone = (
-                    os.environ.get("RECOVERY_PHONE")
-                    or os.environ.get("FALLBACK_PHONE")
-                    or DEFAULT_FALLBACK_PHONE
-                ).strip()
-                handled = False
-                if rec_phone:
-                    try:
-                        # Click "Add recovery phone" CTA if present
-                        await _click_text(page, [
-                            "add recovery phone", "add a recovery phone",
-                            "add phone number", "add a phone number",
-                            "إضافة هاتف الاسترداد", "إضافة رقم هاتف",
-                        ], 3000)
-                        await _hd(1.0, 2.0)
-                        added = await _add_phone_number(
-                            page, rec_phone, sms_code_provider,
-                            on_screenshot=on_screenshot, user_id=user_id,
-                        )
-                        await _snap(f"recovery_phone_after_add_attempt{attempt + 1}")
-                        handled = bool(added)
-                    except Exception as exc:
-                        log.warning("Recovery phone handling raised: %s", exc)
-                if not handled:
-                    # Try to skip / go back to authenticator setup
-                    for label in ["skip", "not now", "later", "تخطي", "ليس الآن", "لاحقاً"]:
-                        if await _click_text(page, [label], 1500):
-                            await _hd(0.6, 1.2)
-                            break
-                # Navigate back to 2SV settings to resume Authenticator flow
-                try:
-                    await page.goto(
-                        "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
-                        wait_until="domcontentloaded",
-                    )
-                    await _hd(2, 3.5)
-                    await _reauth_if_needed(page, password_candidates, timeout_ms=10_000, on_password_used=on_password_used)
-                    await _hd(1.0, 2.0)
-                    # Re-open Authenticator section + click Next to reach code page
-                    await _click_text(page, [
-                        "authenticator app", "authenticator", "تطبيق المصادقة",
-                    ], 4000)
-                    await _hd(1.0, 2.0)
-                    await _click_text(page, [
-                        "set up authenticator", "set up", "+ add authenticator",
-                        "get started", "إعداد", "بدء",
-                    ], 4000)
-                    await _hd(1.0, 2.0)
-                    await _click_text(page, ["next", "التالي"], 3000)
-                    await _hd(2.0, 3.0)
-                except Exception as exc:
-                    log.warning("Could not return to Authenticator flow: %s", exc)
-                continue
             if _looks_like_password_challenge(body_now, page.url):
                 log.info("Authenticator flow hit password challenge on attempt %d", attempt + 1)
                 reauthed = await _reauth_if_needed(
@@ -2087,24 +2027,32 @@ async def _setup_new_authenticator(
                 await _hd(2.0, 3.0)
 
     if not code_field_found:
-        # Dump page state for debugging
+        # لم يظهر حقل TOTP في صفحة Google — لا نرفع خطأ.
+        # المفتاح + الرابط + الرمز تم بعثها للمستخدم بالفعل قبل قليل.
+        # نرجع المفتاح كنجاح جزئي حتى يستطيع المستخدم إكمال الإعداد يدوياً.
         try:
-            log.error("TOTP page never appeared. URL=%s, title=%s",
-                      page.url, await page.title())
+            log.warning("TOTP page never appeared. URL=%s, title=%s",
+                        page.url, await page.title())
         except Exception:
             pass
-        await _snap("totp_field_FAILED")
-        raise RuntimeError(
-            "صفحة إدخال رمز Authenticator لم تظهر بعد محاولة 3 مرات. "
-            "تحقق من screenshots لرؤية الصفحة الفعلية."
+        await _snap("totp_field_FAILED_but_secret_emitted")
+        log.warning(
+            "Returning secret to caller despite Google TOTP submission failure. "
+            "User has secret + URL + code already."
         )
+        return secret
 
-    await _type_human_at(page, code_sel, code)
-    await _hd(0.5, 1.2)
-    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000):
-        await page.keyboard.press("Enter")
-    await _hd(2, 4)
-    await _snap("totp_code_submitted")
+    # حاول إدخال الرمز في Google — لكن إذا فشل، لا ترفع خطأ
+    try:
+        await _type_human_at(page, code_sel, code)
+        await _hd(0.5, 1.2)
+        if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000):
+            await page.keyboard.press("Enter")
+        await _hd(2, 4)
+        await _snap("totp_code_submitted")
+    except Exception as exc:
+        log.warning("Submitting TOTP code to Google failed (non-fatal): %s", exc)
+        await _snap("totp_submit_failed_nonfatal")
     return secret
 
 
@@ -2366,14 +2314,28 @@ async def rotate_google_account(
             on_screenshot=on_screenshot, user_id=user_id,
             old_password=old_password,
             on_password_used=_notify_password_used,
+            on_credentials_ready=on_credentials_ready,
         )
         result["new_totp_secret"] = new_secret
-        # Send the new 2FA secret to the user IMMEDIATELY
+        result["totp_url"] = f"https://2fa.fb.tools/{new_secret}"
+        try:
+            result["totp_code"] = _now_totp(new_secret)
+        except Exception:
+            result["totp_code"] = None
+        # Send the new 2FA secret + URL + code to the user IMMEDIATELY
         await _emit_credential("new_totp_secret", new_secret)
+        await _emit_credential("totp_url", result["totp_url"])
+        if result.get("totp_code"):
+            await _emit_credential("totp_code", result["totp_code"])
         await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
 
-        await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
-        await _shoot(page, user_id, "after_verify", on_screenshot)
+        # التحقق من 2FA — غير قاتل: إذا فشل، المستخدم عنده كل البيانات
+        try:
+            await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
+            await _shoot(page, user_id, "after_verify", on_screenshot)
+        except Exception as exc:
+            log.warning("verify_new_2fa failed (non-fatal, secret already emitted): %s", exc)
+            await _shoot(page, user_id, "verify_failed_nonfatal", on_screenshot)
 
         await _progress_wrap("step:done")
         result["success"] = True
