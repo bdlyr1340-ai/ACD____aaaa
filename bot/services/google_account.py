@@ -1920,8 +1920,8 @@ async def _setup_new_authenticator(
     await _snap("totp_secret_extracted")
 
     # ── EMIT credentials to user IMMEDIATELY (before risky TOTP submission) ──
-    # هذه أهم نقطة: أرسل للمستخدم المفتاح والرابط والرمز فوراً، حتى لو فشل
-    # إدخال الرمز في Google لاحقاً، المستخدم عنده كل البيانات.
+    # نرسل للمستخدم المفتاح + الرابط + الرمز فوراً، حتى لو فشل أي شيء بعدها
+    # المستخدم يكون قد استلم كل البيانات.
     if on_credentials_ready is not None:
         try:
             await on_credentials_ready("new_totp_secret", secret)
@@ -2027,31 +2027,43 @@ async def _setup_new_authenticator(
                 await _hd(2.0, 3.0)
 
     if not code_field_found:
-        # لم يظهر حقل TOTP في صفحة Google — لا نرفع خطأ.
-        # المفتاح + الرابط + الرمز تم بعثها للمستخدم بالفعل قبل قليل.
-        # نرجع المفتاح كنجاح جزئي حتى يستطيع المستخدم إكمال الإعداد يدوياً.
+        # حقل TOTP لم يظهر — لا نرفع خطأ. المفتاح + الرابط + الرمز
+        # تم إرسالها للمستخدم سابقاً. نعتبرها نجاح جزئي.
         try:
             log.warning("TOTP page never appeared. URL=%s, title=%s",
                         page.url, await page.title())
         except Exception:
             pass
         await _snap("totp_field_FAILED_but_secret_emitted")
-        log.warning(
-            "Returning secret to caller despite Google TOTP submission failure. "
-            "User has secret + URL + code already."
-        )
+        log.warning("Secret already emitted — returning secret as partial success")
         return secret
 
-    # حاول إدخال الرمز في Google — لكن إذا فشل، لا ترفع خطأ
+    # حاول إدخال رمز TOTP في Google — إذا فشل لا نرفع خطأ
     try:
+        # نولّد الرمز مجدداً (قد يكون انتهى الصلاحية بعد المحاولات)
+        try:
+            code = _now_totp(secret)
+        except Exception:
+            pass
         await _type_human_at(page, code_sel, code)
         await _hd(0.5, 1.2)
         if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000):
             await page.keyboard.press("Enter")
-        await _hd(2, 4)
+        await _hd(3, 5)
         await _snap("totp_code_submitted")
+
+        # محاولة الضغط على "Done" / "Turn on" لتفعيل المصادقة الثنائية نهائياً
+        for label in [
+            "done", "turn on", "save", "finish",
+            "تم", "تفعيل", "حفظ", "إنهاء", "موافق",
+        ]:
+            if await _click_text(page, [label], 2500):
+                await _hd(1.0, 2.0)
+                break
+        await _snap("after_2sv_finalized")
+        log.info("2FA setup finalized successfully")
     except Exception as exc:
-        log.warning("Submitting TOTP code to Google failed (non-fatal): %s", exc)
+        log.warning("Submitting TOTP/finalizing 2SV failed (non-fatal): %s", exc)
         await _snap("totp_submit_failed_nonfatal")
     return secret
 
@@ -2322,19 +2334,19 @@ async def rotate_google_account(
             result["totp_code"] = _now_totp(new_secret)
         except Exception:
             result["totp_code"] = None
-        # Send the new 2FA secret + URL + code to the user IMMEDIATELY
+        # Send 2FA secret + URL + code IMMEDIATELY (in case callback above missed)
         await _emit_credential("new_totp_secret", new_secret)
         await _emit_credential("totp_url", result["totp_url"])
         if result.get("totp_code"):
             await _emit_credential("totp_code", result["totp_code"])
         await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
 
-        # التحقق من 2FA — غير قاتل: إذا فشل، المستخدم عنده كل البيانات
+        # verify غير قاتل: المستخدم استلم كل البيانات بالفعل
         try:
             await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
             await _shoot(page, user_id, "after_verify", on_screenshot)
         except Exception as exc:
-            log.warning("verify_new_2fa failed (non-fatal, secret already emitted): %s", exc)
+            log.warning("verify_new_2fa failed (non-fatal): %s", exc)
             await _shoot(page, user_id, "verify_failed_nonfatal", on_screenshot)
 
         await _progress_wrap("step:done")
