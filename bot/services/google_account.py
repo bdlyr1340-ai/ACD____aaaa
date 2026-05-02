@@ -1043,11 +1043,14 @@ async def _add_phone_number(
         return False
     await _snap("1_page_loaded")
 
-    # ── Step 2: click "Add recovery phone" / "Add phone" if shown ──
-    # Some accounts show a CTA button before the input form.
+    # ── Step 2: click "Add now" / "Add recovery phone" / "Add phone" if shown ──
+    # On the /phone page, the button is usually "Add now". On other variants
+    # it might be "Add recovery phone" or "Add a phone number".
     log.info("Looking for Add-phone CTA button")
     cta_clicked = False
     for sel in [
+        'button:has-text("Add now")',
+        '[role="button"]:has-text("Add now")',
         'button:has-text("Add recovery phone")',
         'button:has-text("Add a phone number")',
         'button:has-text("Add phone number")',
@@ -1055,6 +1058,7 @@ async def _add_phone_number(
         '[role="button"]:has-text("Add recovery phone")',
         '[role="button"]:has-text("Add phone number")',
         '[role="button"]:has-text("Add a phone number")',
+        'a:has-text("Add now")',
         'a:has-text("Add recovery phone")',
         'a:has-text("Add a phone number")',
     ]:
@@ -1069,10 +1073,19 @@ async def _add_phone_number(
                 await loc.click(timeout=4000)
                 cta_clicked = True
                 log.info("Clicked CTA via: %s", sel)
-                await _hd(2, 3.5)
+                await _hd(2.5, 4)
                 break
         except Exception:
             continue
+    if not cta_clicked:
+        # Text-search fallback
+        if await _click_text(page, [
+            "add now", "add recovery phone", "add a phone number",
+            "add phone number", "إضافة الآن", "أضف الآن",
+        ], 4000):
+            cta_clicked = True
+            log.info("Clicked CTA via text search")
+            await _hd(2.5, 4)
     await _snap("2_after_cta")
 
     # ── Step 3: wait for the phone input field ──
