@@ -1,9 +1,10 @@
-"""Keyboards — Pro v12.
+"""Keyboards — Pro v13.
 
-Adds:
-  • زر "🆕 إنشاء حساب Gmail"
-  • زر "🔑 كلمة سر ثابتة" (set/clear custom password)
-Keeps all previous buttons.
+Adds a sub-menu for Gmail creation:
+  • 🆕 إنشاء Gmail  →  opens submenu:
+        ✍️ إنشاء يدوي    (user provides First|Last|YYYY-MM-DD|m/f)
+        🤖 إنشاء تلقائي  (random everything; asks for COUNT)
+Keeps every previous button intact.
 """
 from __future__ import annotations
 
@@ -33,6 +34,15 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("ℹ️ المساعدة", callback_data="help")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def create_gmail_menu() -> InlineKeyboardMarkup:
+    """Submenu: choose Manual vs Auto creation."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ إنشاء يدوي", callback_data="cg_manual")],
+        [InlineKeyboardButton("🤖 إنشاء تلقائي", callback_data="cg_auto")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back")],
+    ])
 
 
 def back_menu() -> InlineKeyboardMarkup:
