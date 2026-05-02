@@ -1040,14 +1040,19 @@ async def _reauth_if_needed(
     )
 
     # Detect re-auth via multiple signals (page text + URL + visible field)
+    # KEY INSIGHT: the most reliable signal is "a visible password field on
+    # any /signinoptions/, /accounts.google.com/v3/, or /signin/challenge URL".
+    # Text matching is unreliable because Google serves the UI in 50+ languages.
     deadline = time.time() + (timeout_ms / 1000.0)
     detected = False
     while time.time() < deadline:
-        # Signal 1: visible password field on the page
+        # Signal 1 (PRIMARY): visible password field on the page
+        # This works regardless of UI language
         try:
             loc = page.locator(pwd_sel).first
             if await loc.count() and await loc.is_visible():
                 detected = True
+                log.info("Re-auth detected: password field visible (lang-agnostic)")
                 break
         except Exception:
             pass
@@ -1057,43 +1062,75 @@ async def _reauth_if_needed(
             if any(p in cur for p in [
                 "signin/challenge", "signin/v2/challenge", "challenge/pwd",
                 "/v3/signin/", "rejected", "/signin/v2/sl/pwd",
+                "accounts.google.com/v3/signin",
             ]):
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
+                    log.info("Re-auth detected via URL: %s", cur)
                     break
                 except Exception:
                     pass
         except Exception:
             pass
-        # Signal 3: visible "Welcome" / "verify it's you" text (all variants)
+        # Signal 3: visible "Welcome" / "verify it's you" text in MANY languages
         try:
             body_text = (await page.inner_text("body")).lower()
             if any(kw in body_text for kw in [
-                # "first verify" variants
+                # English variants
                 "to continue, first verify",
                 "first verify that it's you",
                 "first verify that it’s you",
                 "first verify that its you",
                 "first verify it",
-                # "verify that" variants (newer wording)
                 "verify that it's you",
                 "verify that it’s you",
                 "verify that its you",
-                # "verify it's you" variants (older wording)
                 "verify it's you",
                 "verify it’s you",
+                "welcome",
+                "enter your password",
                 # Arabic
                 "للمتابعة، تحقّق",
                 "تحقق من هويتك",
                 "تأكّد من هويتك",
-                # Welcome page generic markers
-                "welcome",
-                "enter your password",
+                "مرحباً",
+                "أدخل كلمة المرور",
+                # French
+                "bienvenue",
+                "veuillez confirmer votre identité",
+                "saisissez votre mot de passe",
+                "confirmer votre identité",
+                # Spanish
+                "te damos la bienvenida",
+                "verifica que eres tú",
+                "introduce tu contraseña",
+                # German
+                "willkommen",
+                "bestätige, dass du es bist",
+                "gib dein passwort ein",
+                # Portuguese
+                "bem-vindo",
+                "confirme que é você",
+                "digite sua senha",
+                # Italian
+                "benvenuto",
+                "verifica che sia tu",
+                # Turkish
+                "hoş geldin",
+                "kimliğini doğrula",
+                # Russian
+                "добро пожаловать",
+                "подтвердите, что это вы",
+                # Indonesian
+                "selamat datang",
+                # Hindi
+                "स्वागत है",
             ]):
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
+                    log.info("Re-auth detected via text keyword")
                     break
                 except Exception:
                     pass
