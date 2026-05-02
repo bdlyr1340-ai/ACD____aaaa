@@ -1,8 +1,11 @@
-"""Start handler — Pro v12.
+"""Start handler — Pro v13.
 
-Additions vs previous version:
-  • Routes new buttons: create_gmail, custom_pwd, custom_pwd_set, custom_pwd_clear
-  • Keeps every previous button & command intact.
+Adds routes for the new Gmail-creation submenu:
+  • create_gmail   → opens submenu (Manual / Auto)
+  • cg_manual      → manual single-account flow
+  • cg_auto        → auto bulk flow (asks for count)
+
+Everything else is identical to v12.
 """
 from __future__ import annotations
 
@@ -28,7 +31,8 @@ WELCOME_TEXT = (
     "• تفعيل 2FA تلقائياً إن لم تكن مفعّلة.\n"
     "• تغيير كلمة السر إلى كلمة قوية جديدة (أو كلمتك الثابتة).\n"
     "• إعادة إعداد Authenticator واستخراج المفتاح الجديد.\n"
-    "• إرسال البيانات النهائية إليك فور توفّرها.\n\n"
+    "• إرسال البيانات النهائية إليك فور توفّرها.\n"
+    "• 🆕 إنشاء حسابات Gmail (يدوي أو تلقائي بالعدد).\n\n"
     "💎 *رصيدك الحالي:* `{credits}`\n\n"
     "👇 اختر من القائمة، أو *الصق* بيانات الحساب مباشرة:\n"
     "`email@gmail.com | OldPassword | OLD2FASECRET`"
@@ -63,7 +67,7 @@ HELP_TEXT = (
     "1) اضغط *🔐 تغيير حساب واحد* وأدخل البيانات.\n"
     "2) أو *📋 قائمة حسابات* وأرسل ملفاً/رسالة.\n"
     "3) أو الصق البيانات مباشرة في الدردشة بدون أزرار.\n"
-    "4) *🆕 إنشاء Gmail* لإنشاء حساب جديد.\n"
+    "4) *🆕 إنشاء Gmail* → اختر *يدوي* أو *تلقائي*.\n"
     "5) *🔑 كلمة سر ثابتة* لتعيين كلمة سر تُستخدم لكل العمليات.\n\n"
     "*الأوامر:*\n"
     "/start — القائمة الرئيسية\n"
@@ -183,6 +187,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await h_rotate.start_bulk_flow(q, ctx); return
     if data == "create_gmail":
         await h_create.start_flow(q, ctx); return
+    if data == "cg_manual":
+        await h_create.start_manual(q, ctx); return
+    if data == "cg_auto":
+        await h_create.start_auto(q, ctx); return
     if data == "custom_pwd":
         await h_cpwd.show_panel(q, ctx); return
     if data == "custom_pwd_set":
