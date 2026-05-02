@@ -1,54 +1,53 @@
-# Google Account Rotator Bot
+# 🔧 إصلاح v7 — معالجة صفحة Recovery Phone
 
-بوت تيليجرام يقوم تلقائياً بـ:
-1. تسجيل الدخول إلى حساب Google باستخدام (إيميل + كلمة سر + مفتاح 2FA).
-2. تجاوز شاشة "Tap on your phone" بالتحويل تلقائياً إلى Google Authenticator.
-3. تغيير كلمة السر إلى كلمة قوية جديدة.
-4. إعادة إعداد المصادقة الثنائية وإنشاء مفتاح 2FA جديد.
-5. إرسال البيانات الجديدة (إيميل + كلمة السر + مفتاح 2FA) للمستخدم.
-6. عند أي فشل: إرسال **لقطة شاشة + اسم الخطوة + نص الخطأ** إلى المستخدم وإلى الأدمن.
+## المشكلة
+عند خطوة `enable_new_authenticator`، Google يفرض على المستخدم إضافة **Recovery phone** (رقم استرداد) قبل السماح بإعداد Authenticator جديد. البوت كان يبحث عن حقل TOTP فلا يجده ويفشل بعد 3 محاولات.
 
-## المتغيرات البيئية المطلوبة
-
-| المتغير | الوصف |
-|---|---|
-| `BOT_TOKEN` | توكن البوت من BotFather |
-| `DATABASE_URL` | رابط Postgres (Railway) |
-| `ADMIN_IDS` | معرّفات الأدمن مفصولة بفواصل |
-| `PROXY_URL` | (اختياري) `http://user:pass@host:port` |
-| `DEFAULT_CREDITS` | الرصيد الافتراضي (3) |
-| `ROTATE_COST` | تكلفة كل عملية (1) |
-| `MAX_BULK_ACCOUNTS` | الحد الأقصى للقائمة (30) |
-| `ROTATE_TIMEOUT_SEC` | المهلة لكل حساب (300) |
-
-## التشغيل المحلي
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-python main.py
+التقرير أظهر:
+```
+url: .../signinoptions/rescuephone
+title: Recovery phone
+body: Add recovery phone
 ```
 
-## Railway
+## الحل
+أضفت دالتين جديدتين إلى `bot/services/google_account.py`:
 
-ملفات `Procfile` و `Dockerfile` و `railway.json` جاهزة. ارفع المستودع و عرّف المتغيرات أعلاه.
+### 1. `_is_recovery_phone_page(url, title, body_text)`
+تكتشف صفحة Recovery phone عبر:
+- URL يحوي `rescuephone` / `recoveryphone`
+- عنوان أو نص الصفحة يحوي "Recovery phone" / "Add recovery phone"
 
-## استخدام البوت
+### 2. `_handle_recovery_phone_page(page, on_progress)`
+- **إذا تم تعريف `RECOVERY_PHONE` في متغيرات البيئة**: يضغط زر "Add recovery phone"، يُدخل الرقم، ثم Next/Save.
+- **إذا لم يكن هناك رقم**: يحاول تخطّي الصفحة (Skip/Not now)، أو الرجوع للوراء، أو التوجّه المباشر لصفحة Authenticator.
 
-- **حساب واحد:** اضغط زر *🔐 تغيير حساب* ثم أرسل:
-  ```
-  email@gmail.com | OldPassword | OLD2FASECRET
-  ```
-- **قائمة حسابات:** اضغط *📋 قائمة حسابات* وأرسل ملف نصي / رسالة فيها سطر لكل حساب بنفس الصيغة.
-- إن لم يوجد 2FA على الحساب: ضع `skip` بدلاً من المفتاح.
+### 3. تكامل مع `_setup_new_authenticator`
+قبل كل محاولة بحث عن حقل TOTP:
+```python
+if _is_recovery_phone_page(page.url, title, body_text):
+    await _handle_recovery_phone_page(page, on_progress)
+    # ثم أعد التوجيه لصفحة Authenticator
+    continue
+```
 
-## أوامر
+---
 
-`/start /me /ref /qd /use /help`  
-أوامر الأدمن: `/admin /stats /addcredit /ban /unban /broadcast /genkey /listkeys`
+## خطوات التطبيق
 
-## ملاحظات هامة
+1. **افتح ملف** `bot/services/google_account.py`
+2. **أضف الدالتين** `_is_recovery_phone_page` و `_handle_recovery_phone_page` من الملف المرفق `google_account_patch_recovery.py` (في أعلى الملف بعد الـ imports).
+3. **عدّل دالة `_setup_new_authenticator`** بإضافة الفحص في بداية كل محاولة (راجع `EXAMPLE_INTEGRATION` في الملف).
+4. **أضف متغير البيئة في Railway:**
+   ```
+   RECOVERY_PHONE=+9647xxxxxxxxx
+   ```
+   (بصيغة دولية كاملة مع رمز الدولة)
+5. **أعد النشر (Redeploy).**
 
-- Google قد يطلب أحياناً تأكيد عبر Recovery Email/Phone — عندها يبلّغ البوت عن الحاجة لتدخّل يدوي ويرسل لقطة الشاشة بدلاً من الفشل الصامت.
-- يُنصح باستخدام بروكسي residential لتقليل احتمالات الحظر من Google.
-- مفتاح TOTP في الإدخال يجب أن يكون نصاً Base32 (مثل `JBSWY3DPEHPK3PXP`)، وليس الكود السداسي المؤقت.
+## ملاحظة مهمة
+- يُفضّل استخدام رقم تليفون صالح فعلاً يستقبل SMS من Google لأن Google قد يُرسل كود تحقق للرقم.
+- إذا لم تُضف `RECOVERY_PHONE`، سيحاول البوت تخطّي الصفحة لكن Google قد يرفض ذلك في بعض الحالات.
+
+## في حال استمرار المشكلة
+أرسل لي `problem.txt` و `solution.txt` الجديد + screenshot لأرى ماذا يظهر بعد التحديث.
