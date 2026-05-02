@@ -1000,21 +1000,39 @@ async def _click_turn_on_2sv(page) -> bool:
     return False
 
 
-async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 25_000) -> bool:
+async def _reauth_if_needed(
+    page,
+    current_password,  # str OR list of str (will try in order)
+    timeout_ms: int = 25_000,
+    *,
+    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> bool:
     """If Google re-prompts for the password (common after clicking sensitive
     settings buttons or opening security pages like /signinoptions/...),
-    fill it automatically using the password passed in.
+    fill it automatically using the password(s) passed in.
 
     Args:
         page: the playwright page
-        current_password: the password to enter (use the NEW password if it
-            was just changed, since that's now the account's active password)
+        current_password: the password to enter, OR a list of passwords to
+            try in order. Useful when we're not sure if Google is asking for
+            the new password (just-changed) or still wants the old one.
+            Example: [new_password, old_password] tries new first, falls
+            back to old if Google rejects new.
         timeout_ms: how long to wait for the password field to appear.
-            Increased default to 25s because Google can take 10-15s to
-            redirect to the Welcome/verify page after .goto() on /signinoptions.
+        on_password_used: optional async callable invoked with the password
+            string that was successfully accepted. Use this to notify the
+            Telegram user which password ended up working.
 
     Returns: True if re-auth was performed, False if no prompt was shown.
     """
+    # Normalize to a list of candidates
+    if isinstance(current_password, str):
+        candidates = [current_password]
+    else:
+        candidates = [p for p in current_password if p]
+    if not candidates:
+        return False
+
     pwd_sel = (
         'input[type="password"][name="Passwd"], '
         'input[type="password"]:not([name="hiddenPassword"])'
@@ -1040,7 +1058,6 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 25_00
                 "signin/challenge", "signin/v2/challenge", "challenge/pwd",
                 "/v3/signin/", "rejected", "/signin/v2/sl/pwd",
             ]):
-                # On challenge pages, wait for password field to render
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
@@ -1057,7 +1074,6 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 25_00
                 "first verify it", "للمتابعة، تحقّق", "تحقق من هويتك",
                 "welcome", "enter your password",
             ]):
-                # Wait a moment for the field to render
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
@@ -1071,55 +1087,90 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 25_00
     if not detected:
         return False  # No re-auth needed
 
-    log.info("Re-auth prompt detected — entering current password")
-    try:
-        loc = page.locator(pwd_sel).first
-        # Clear field first (in case Google pre-filled something)
+    # Try each candidate password in order
+    for idx, pwd in enumerate(candidates):
+        label = f"#{idx+1} of {len(candidates)}"
+        log.info("Re-auth: trying password candidate %s (len=%d)", label, len(pwd))
         try:
-            await loc.fill("")
-            await _hd(0.2, 0.4)
-        except Exception:
-            pass
-        await loc.click()
-        await _hd(0.3, 0.7)
-        # Type character by character (more human-like + safer)
-        for ch in current_password:
-            await page.keyboard.type(ch)
-            await asyncio.sleep(random.uniform(0.04, 0.12))
-        await _hd(0.4, 0.8)
-        nxt = page.locator("#passwordNext").first
-        if await nxt.count() == 0:
-            nxt = page.get_by_role("button", name="Next")
-        if await nxt.count() > 0:
-            await nxt.click()
-        else:
-            await page.keyboard.press("Enter")
-        await _hd(3, 5)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-        # Verify the password was accepted: the password field should be gone
-        try:
+            loc = page.locator(pwd_sel).first
+            if not (await loc.count() and await loc.is_visible()):
+                # Field gone — assume success of previous attempt
+                log.info("Re-auth: password field disappeared — assuming success")
+                return True
+            # Clear and fill
+            try:
+                await loc.fill("")
+                await _hd(0.2, 0.4)
+            except Exception:
+                pass
+            await loc.click()
+            await _hd(0.3, 0.7)
+            for ch in pwd:
+                await page.keyboard.type(ch)
+                await asyncio.sleep(random.uniform(0.04, 0.12))
+            await _hd(0.4, 0.8)
+            nxt = page.locator("#passwordNext").first
+            if await nxt.count() == 0:
+                nxt = page.get_by_role("button", name="Next")
+            if await nxt.count() > 0:
+                await nxt.click()
+            else:
+                await page.keyboard.press("Enter")
+            await _hd(3, 5)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+
+            # Check if password was accepted: field should be gone
             still_there = page.locator(pwd_sel).first
-            if await still_there.count() and await still_there.is_visible():
-                # Field still visible → password was rejected
-                # Check for an error message
+            field_visible = False
+            try:
+                if await still_there.count() and await still_there.is_visible():
+                    field_visible = True
+            except Exception:
+                pass
+
+            if not field_visible:
+                # Password accepted!
+                log.info("Re-auth SUCCESS with candidate %s", label)
+                if on_password_used is not None:
+                    try:
+                        await on_password_used(pwd)
+                    except Exception as exc:
+                        log.warning("on_password_used callback failed: %s", exc)
+                return True
+
+            # Field still there — check if Google showed an error
+            try:
                 body = (await page.inner_text("body")).lower()
-                if any(kw in body for kw in [
-                    "wrong password", "incorrect", "كلمة المرور غير صحيحة",
-                    "couldn't verify", "couldn’t verify",
-                ]):
-                    log.warning("Re-auth password was REJECTED by Google")
-                    return False
-                log.warning("Password field still visible after submit — may have failed")
-        except Exception:
-            pass
-        log.info("Re-auth completed successfully")
-        return True
-    except Exception as exc:
-        log.warning("Re-auth attempt failed: %s", exc)
-        return False
+            except Exception:
+                body = ""
+            rejected = any(kw in body for kw in [
+                "wrong password", "incorrect password", "couldn't verify",
+                "couldn’t verify", "كلمة المرور غير صحيحة", "غير صحيحة",
+                "password is incorrect",
+            ])
+            if rejected:
+                log.warning("Re-auth: password candidate %s REJECTED — trying next", label)
+                # Continue to next candidate
+                continue
+            else:
+                # Field still visible but no clear error — could be loading
+                log.warning("Re-auth: field still visible but no error msg — assuming success")
+                if on_password_used is not None:
+                    try:
+                        await on_password_used(pwd)
+                    except Exception:
+                        pass
+                return True
+
+        except Exception as exc:
+            log.warning("Re-auth attempt with %s failed: %s", label, exc)
+            continue
+
+    log.warning("Re-auth: ALL %d password candidates failed", len(candidates))
+    return False
 
 
 async def _add_phone_number(
@@ -1478,6 +1529,8 @@ async def _setup_new_authenticator(
     *,
     on_screenshot: Optional[ScreenshotCallback] = None,
     user_id: int = 0,
+    old_password: str = "",
+    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     async def _snap(tag: str) -> None:
         await _shoot(page, user_id, tag, on_screenshot)
@@ -1491,7 +1544,7 @@ async def _setup_new_authenticator(
     await _snap("2sv_page_loaded")
 
     # Re-auth may be required to open the 2SV settings page itself
-    await _reauth_if_needed(page, current_password)
+    await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
     await _hd(1.5, 2.5)
 
     # Default phone is hard-coded but can be overridden via env var.
@@ -1543,7 +1596,7 @@ async def _setup_new_authenticator(
                         wait_until="domcontentloaded",
                     )
                     await _hd(2, 3.5)
-                    await _reauth_if_needed(page, current_password)
+                    await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
                     await _hd(1.5, 2.5)
                     await _snap("2sv_page_after_phone")
                 except Exception as exc:
@@ -1557,7 +1610,7 @@ async def _setup_new_authenticator(
         log.info("Clicking 'Turn on 2-Step Verification'")
         if await _click_turn_on_2sv(page):
             await _hd(2, 3.5)
-            await _reauth_if_needed(page, current_password)
+            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
             await _hd(1.5, 2.5)
             await _snap("after_click_turn_on_2sv")
 
@@ -1624,13 +1677,13 @@ async def _setup_new_authenticator(
                                 wait_until="domcontentloaded",
                             )
                             await _hd(2, 3.5)
-                            await _reauth_if_needed(page, current_password)
+                            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
                             await _hd(1.5, 2.5)
                         except Exception as exc:
                             log.warning("Could not reload 2SV page: %s", exc)
                         if await _click_turn_on_2sv(page):
                             await _hd(2, 3.5)
-                            await _reauth_if_needed(page, current_password)
+                            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
                             await _hd(1.5, 2.5)
                             await _snap("after_2sv_retry")
                 else:
@@ -2025,9 +2078,21 @@ async def rotate_google_account(
         await _emit_credential("new_password", new_password)
         await _shoot(page, user_id, "after_change_password", on_screenshot)
 
+        # Build a callback that tells the user which password worked
+        async def _notify_password_used(pwd_used: str) -> None:
+            label = "new_password" if pwd_used == new_password else "old_password_still_active"
+            log.info("Password actually used during reauth: %s", label)
+            if on_credentials_ready is not None:
+                try:
+                    await on_credentials_ready("password_used_for_reauth", pwd_used)
+                except Exception as exc:
+                    log.warning("on_credentials_ready callback failed: %s", exc)
+
         new_secret = await _setup_new_authenticator(
             page, _progress_wrap, new_password, sms_code_provider,
             on_screenshot=on_screenshot, user_id=user_id,
+            old_password=old_password,
+            on_password_used=_notify_password_used,
         )
         result["new_totp_secret"] = new_secret
         # Send the new 2FA secret to the user IMMEDIATELY
