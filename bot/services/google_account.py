@@ -866,15 +866,42 @@ async def _change_password(page, on_progress: ProgressCallback,
     if n < 2:
         raise RuntimeError("حقول كلمة السر الجديدة غير ظاهرة")
 
-    # Fill new password (field #1)
-    await fields.nth(0).click()
-    await _hd(0.2, 0.5)
-    await page.keyboard.type(new_pwd, delay=random.randint(40, 90))
-    await _hd(0.4, 0.9)
-    # Confirm new password (field #2)
-    await fields.nth(1).click()
-    await _hd(0.2, 0.5)
-    await page.keyboard.type(new_pwd, delay=random.randint(40, 90))
+    # Fill new password (field #1) using fill() for guaranteed exact value
+    # Then verify by reading the value back. This avoids the "Passwords don't
+    # match" error that happens when keyboard.type() drops characters or the
+    # focus jumps between fields mid-typing.
+    log.info("Filling new password into both fields")
+
+    async def _fill_and_verify(field_index: int) -> bool:
+        """Fill field N with new_pwd, verify, retry once if mismatch."""
+        for attempt in range(2):
+            try:
+                f = fields.nth(field_index)
+                await f.click()
+                await _hd(0.2, 0.4)
+                # Clear first
+                await f.fill("")
+                await _hd(0.15, 0.3)
+                # Use fill() — sets value atomically, no focus issues
+                await f.fill(new_pwd)
+                await _hd(0.3, 0.6)
+                # Verify the field actually contains what we set
+                actual = await f.input_value()
+                if actual == new_pwd:
+                    log.info("Field #%d filled correctly (len=%d)", field_index, len(actual))
+                    return True
+                log.warning("Field #%d mismatch (got len=%d, expected %d) — retrying",
+                            field_index, len(actual), len(new_pwd))
+            except Exception as exc:
+                log.warning("Field #%d fill attempt %d failed: %s", field_index, attempt, exc)
+                await _hd(0.5, 1.0)
+        return False
+
+    if not await _fill_and_verify(0):
+        raise RuntimeError("تعذّر ملء حقل كلمة السر الجديدة بشكل صحيح")
+    await _hd(0.4, 0.8)
+    if not await _fill_and_verify(1):
+        raise RuntimeError("تعذّر ملء حقل تأكيد كلمة السر بشكل صحيح")
     await _hd(0.6, 1.2)
 
     # Tab out so Google validates the strength meter
