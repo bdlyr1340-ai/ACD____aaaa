@@ -826,7 +826,8 @@ async def _click_change_password_button(page) -> bool:
     return False
 
 
-async def _change_password(page, on_progress: ProgressCallback) -> str:
+async def _change_password(page, on_progress: ProgressCallback,
+                           old_password: str = "") -> str:
     await on_progress("step:open_security_page")
     # Use fixed password from env var or hard-coded default
     new_pwd = os.environ.get("NEW_PASSWORD", DEFAULT_NEW_PASSWORD).strip()
@@ -840,6 +841,15 @@ async def _change_password(page, on_progress: ProgressCallback) -> str:
         wait_until="domcontentloaded",
     )
     await _hd(2, 3.5)
+
+    # Google often shows a "verify it's you" / Welcome page before allowing
+    # password changes. Detect and handle it using the OLD password (because
+    # we haven't changed it yet at this point).
+    if old_password:
+        reauth_done = await _reauth_if_needed(page, old_password, timeout_ms=15_000)
+        if reauth_done:
+            log.info("Re-auth completed before password change")
+            await _hd(2, 3)
 
     pwd_sel = 'input[type="password"]'
     try:
@@ -963,7 +973,7 @@ async def _click_turn_on_2sv(page) -> bool:
     return False
 
 
-async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_000) -> bool:
+async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 25_000) -> bool:
     """If Google re-prompts for the password (common after clicking sensitive
     settings buttons or opening security pages like /signinoptions/...),
     fill it automatically using the password passed in.
@@ -972,7 +982,9 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_00
         page: the playwright page
         current_password: the password to enter (use the NEW password if it
             was just changed, since that's now the account's active password)
-        timeout_ms: how long to wait for the password field to appear
+        timeout_ms: how long to wait for the password field to appear.
+            Increased default to 25s because Google can take 10-15s to
+            redirect to the Welcome/verify page after .goto() on /signinoptions.
 
     Returns: True if re-auth was performed, False if no prompt was shown.
     """
@@ -999,11 +1011,11 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_00
             cur = page.url.lower()
             if any(p in cur for p in [
                 "signin/challenge", "signin/v2/challenge", "challenge/pwd",
-                "/v3/signin/", "rejected",
+                "/v3/signin/", "rejected", "/signin/v2/sl/pwd",
             ]):
                 # On challenge pages, wait for password field to render
                 try:
-                    await page.wait_for_selector(pwd_sel, timeout=3_000, state="visible")
+                    await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
                     break
                 except Exception:
@@ -1016,10 +1028,11 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_00
             if any(kw in body_text for kw in [
                 "to continue, first verify", "verify it's you", "verify it’s you",
                 "first verify it", "للمتابعة، تحقّق", "تحقق من هويتك",
+                "welcome", "enter your password",
             ]):
                 # Wait a moment for the field to render
                 try:
-                    await page.wait_for_selector(pwd_sel, timeout=3_000, state="visible")
+                    await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
                     break
                 except Exception:
@@ -1059,6 +1072,23 @@ async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_00
             await page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
+        # Verify the password was accepted: the password field should be gone
+        try:
+            still_there = page.locator(pwd_sel).first
+            if await still_there.count() and await still_there.is_visible():
+                # Field still visible → password was rejected
+                # Check for an error message
+                body = (await page.inner_text("body")).lower()
+                if any(kw in body for kw in [
+                    "wrong password", "incorrect", "كلمة المرور غير صحيحة",
+                    "couldn't verify", "couldn’t verify",
+                ]):
+                    log.warning("Re-auth password was REJECTED by Google")
+                    return False
+                log.warning("Password field still visible after submit — may have failed")
+        except Exception:
+            pass
+        log.info("Re-auth completed successfully")
         return True
     except Exception as exc:
         log.warning("Re-auth attempt failed: %s", exc)
@@ -1962,7 +1992,7 @@ async def rotate_google_account(
         page = page_holder["page"]  # may have been swapped
         await _shoot(page, user_id, "after_login", on_screenshot)
 
-        new_password = await _change_password(page, _progress_wrap)
+        new_password = await _change_password(page, _progress_wrap, old_password)
         result["new_password"] = new_password
         # Send the new password to the user IMMEDIATELY
         await _emit_credential("new_password", new_password)
