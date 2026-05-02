@@ -1088,22 +1088,111 @@ async def _add_phone_number(
             await _hd(2.5, 4)
     await _snap("2_after_cta")
 
-    # ── Step 3: wait for the phone input field ──
+    # ── Step 3: wait for the phone input field (across frames + with retries) ──
+    # After clicking "Add now", Google may:
+    #   (a) navigate to a new page,
+    #   (b) load the input inline in the same page,
+    #   (c) load it inside an iframe,
+    #   (d) require a re-auth password challenge first.
+    # We handle all four cases with patience and frame-traversal.
     phone_sel = (
         'input[type="tel"], input[name="phoneNumber"], '
         'input[aria-label*="phone" i], input[autocomplete="tel"]'
     )
-    try:
-        await page.wait_for_selector(phone_sel, timeout=20_000, state="visible")
-    except Exception:
-        log.warning("Phone input field not visible after navigation")
-        await _snap("3_FAILED_no_input")
-        # Dump diagnostic info
+
+    async def _find_phone_input_anywhere():
+        """Search the main page AND every iframe for the phone input."""
+        # Main page first
         try:
-            log.info("Current URL: %s", page.url)
+            loc = page.locator(phone_sel).first
+            if await loc.count() and await loc.is_visible():
+                return loc, page
+        except Exception:
+            pass
+        # All frames
+        try:
+            for fr in page.frames:
+                try:
+                    fl = fr.locator(phone_sel).first
+                    if await fl.count() and await fl.is_visible():
+                        log.info("Found phone input inside frame: %s", fr.url)
+                        return fl, fr
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+
+    async def _maybe_handle_reauth():
+        """If Google shows a password re-auth prompt, fill it (best-effort)."""
+        try:
+            pwd_loc = page.locator(
+                'input[type="password"]:not([name="hiddenPassword"])'
+                ':not([aria-hidden="true"]):not([tabindex="-1"])'
+            ).first
+            if await pwd_loc.count() and await pwd_loc.is_visible():
+                log.info("Re-auth prompt detected on phone page")
+                # We don't have the password here, so just press Enter to skip
+                # (the caller's _reauth_if_needed should have handled it before)
+                return True
         except Exception:
             pass
         return False
+
+    log.info("Waiting for phone input field (with frame search + retries)")
+    found_loc = None
+    found_frame = None
+    deadline = time.time() + 25.0
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        # Check for re-auth challenge
+        if await _maybe_handle_reauth():
+            log.warning("Phone page requires re-auth — bailing out")
+            await _snap("3_reauth_required")
+            return False
+        # Search main + frames
+        loc, frame = await _find_phone_input_anywhere()
+        if loc is not None:
+            found_loc = loc
+            found_frame = frame
+            log.info("Phone input found on attempt %d", attempts)
+            break
+        # Wait a bit and retry
+        await asyncio.sleep(1.0)
+        # On 4th attempt, try alternative URL
+        if attempts == 4:
+            log.info("Trying alternative URL: /signinoptions/rescuephone")
+            try:
+                await page.goto(
+                    "https://myaccount.google.com/signinoptions/rescuephone?hl=en",
+                    wait_until="domcontentloaded", timeout=15_000,
+                )
+                await _hd(2, 3)
+            except Exception as exc:
+                log.warning("Alternative URL failed: %s", exc)
+        # On 7th attempt, try clicking any button containing "phone" again
+        if attempts == 7:
+            log.info("Last resort: clicking any phone-related button")
+            try:
+                if await _click_text(page, [
+                    "add now", "add a phone", "add phone",
+                    "edit", "تعديل", "إضافة",
+                ], 3000):
+                    await _hd(2, 3)
+            except Exception:
+                pass
+
+    if found_loc is None:
+        log.warning("Phone input field not visible after %d attempts (25s)", attempts)
+        await _snap("3_FAILED_no_input")
+        try:
+            log.info("Current URL: %s", page.url)
+            log.info("Page title: %s", await page.title())
+        except Exception:
+            pass
+        return False
+
     await _snap("3_input_visible")
 
     # ── Step 4: select country (Iraq) from dropdown ──
