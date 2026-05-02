@@ -1,6 +1,8 @@
-"""Start handler — main menu, info commands, and button routing.
+"""Start handler — Pro v12.
 
-Pro Edition: smarter welcome, format help, upload hint, my-stats panel.
+Additions vs previous version:
+  • Routes new buttons: create_gmail, custom_pwd, custom_pwd_set, custom_pwd_clear
+  • Keeps every previous button & command intact.
 """
 from __future__ import annotations
 
@@ -12,6 +14,8 @@ from telegram.ext import ContextTypes
 from bot import config
 from bot.db import models
 from bot.handlers import rotate as h_rotate
+from bot.handlers import create_gmail as h_create
+from bot.handlers import custom_pwd as h_cpwd
 from bot.utils.keyboards import back_menu, main_menu
 
 log = logging.getLogger(__name__)
@@ -22,9 +26,9 @@ WELCOME_TEXT = (
     "• تسجيل الدخول التلقائي.\n"
     "• تخطّي المصادقة الثنائية (Authenticator أو Tap-Yes).\n"
     "• تفعيل 2FA تلقائياً إن لم تكن مفعّلة.\n"
-    "• تغيير كلمة السر إلى كلمة قوية جديدة.\n"
+    "• تغيير كلمة السر إلى كلمة قوية جديدة (أو كلمتك الثابتة).\n"
     "• إعادة إعداد Authenticator واستخراج المفتاح الجديد.\n"
-    "• إرسال البيانات النهائية إليك.\n\n"
+    "• إرسال البيانات النهائية إليك فور توفّرها.\n\n"
     "💎 *رصيدك الحالي:* `{credits}`\n\n"
     "👇 اختر من القائمة، أو *الصق* بيانات الحساب مباشرة:\n"
     "`email@gmail.com | OldPassword | OLD2FASECRET`"
@@ -58,13 +62,17 @@ HELP_TEXT = (
     "📖 *دليل الاستخدام*\n\n"
     "1) اضغط *🔐 تغيير حساب واحد* وأدخل البيانات.\n"
     "2) أو *📋 قائمة حسابات* وأرسل ملفاً/رسالة.\n"
-    "3) أو الصق البيانات مباشرة في الدردشة بدون أزرار.\n\n"
+    "3) أو الصق البيانات مباشرة في الدردشة بدون أزرار.\n"
+    "4) *🆕 إنشاء Gmail* لإنشاء حساب جديد.\n"
+    "5) *🔑 كلمة سر ثابتة* لتعيين كلمة سر تُستخدم لكل العمليات.\n\n"
     "*الأوامر:*\n"
     "/start — القائمة الرئيسية\n"
     "/me — حسابي ورصيدي\n"
     "/ref — رابط الدعوة\n"
     "/qd — تسجيل حضور يومي\n"
     "/use `<كود>` — استخدام كود تفعيل\n"
+    "/setpwd `<كلمة>` — تعيين كلمة سر ثابتة\n"
+    "/clearpwd — إلغاء كلمة السر الثابتة\n"
     "/help — المساعدة\n"
 )
 
@@ -173,6 +181,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await h_rotate.start_single_flow(q, ctx); return
     if data == "rotate_bulk":
         await h_rotate.start_bulk_flow(q, ctx); return
+    if data == "create_gmail":
+        await h_create.start_flow(q, ctx); return
+    if data == "custom_pwd":
+        await h_cpwd.show_panel(q, ctx); return
+    if data == "custom_pwd_set":
+        await h_cpwd.start_set(q, ctx); return
+    if data == "custom_pwd_clear":
+        await h_cpwd.do_clear(q, ctx); return
     if data == "cancel":
         ctx.user_data.clear()
         await q.message.reply_text("✖️ تم الإلغاء.", reply_markup=main_menu()); return
