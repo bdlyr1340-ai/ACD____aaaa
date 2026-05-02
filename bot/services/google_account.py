@@ -1066,13 +1066,30 @@ async def _reauth_if_needed(
                     pass
         except Exception:
             pass
-        # Signal 3: visible "Welcome" / "verify it's you" text
+        # Signal 3: visible "Welcome" / "verify it's you" text (all variants)
         try:
             body_text = (await page.inner_text("body")).lower()
             if any(kw in body_text for kw in [
-                "to continue, first verify", "verify it's you", "verify it’s you",
-                "first verify it", "للمتابعة، تحقّق", "تحقق من هويتك",
-                "welcome", "enter your password",
+                # "first verify" variants
+                "to continue, first verify",
+                "first verify that it's you",
+                "first verify that it’s you",
+                "first verify that its you",
+                "first verify it",
+                # "verify that" variants (newer wording)
+                "verify that it's you",
+                "verify that it’s you",
+                "verify that its you",
+                # "verify it's you" variants (older wording)
+                "verify it's you",
+                "verify it’s you",
+                # Arabic
+                "للمتابعة، تحقّق",
+                "تحقق من هويتك",
+                "تأكّد من هويتك",
+                # Welcome page generic markers
+                "welcome",
+                "enter your password",
             ]):
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
