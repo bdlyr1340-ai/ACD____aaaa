@@ -168,6 +168,114 @@ async def _capture(page, user_id: int, tag: str) -> Dict[str, Optional[str]]:
     return out
 
 
+def _looks_like_password_challenge(body_text: str, url: str = "") -> bool:
+    body = (body_text or "").lower()
+    cur = (url or "").lower()
+    return any(kw in body for kw in [
+        "to continue, first verify",
+        "first verify that it's you",
+        "first verify that it’s you",
+        "verify it's you",
+        "verify it’s you",
+        "enter your password",
+        "welcome",
+        "للمتابعة، تحقّق",
+        "تحقق من هويتك",
+        "تأكّد من هويتك",
+        "أدخل كلمة المرور",
+        "مرحباً",
+    ]) or any(path in cur for path in [
+        "signin/challenge",
+        "signin/v2/challenge",
+        "challenge/pwd",
+        "/v3/signin/",
+        "accounts.google.com/v3/signin",
+    ])
+
+
+async def _write_admin_debug_reports(
+    page,
+    *,
+    user_id: int,
+    step: str,
+    error_text: str,
+    screenshot_path: Optional[str] = None,
+    html_path: Optional[str] = None,
+    old_password: str = "",
+    new_password: str = "",
+    password_used_for_reauth: str = "",
+) -> Dict[str, Optional[str]]:
+    ts = int(time.time() * 1000)
+    base = f"{user_id}_{ts}_{step}"
+    problem_path = os.path.join(SHOTS_DIR, f"{base}_problem.txt")
+    solution_path = os.path.join(SHOTS_DIR, f"{base}_solution.txt")
+
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    try:
+        body = await page.inner_text("body")
+    except Exception:
+        body = ""
+
+    body_excerpt = (body or "").strip()
+    if len(body_excerpt) > 4000:
+        body_excerpt = body_excerpt[:4000] + "\n...[truncated]"
+
+    password_gate = _looks_like_password_challenge(body, url)
+    try:
+        totp_visible = await page.locator(
+            'input[type="tel"], input#totpPin, input[name="totpPin"], input[autocomplete="one-time-code"]'
+        ).first.is_visible()
+    except Exception:
+        totp_visible = False
+
+    problem_text = (
+        "Google rotation debug report\n"
+        f"step: {step}\n"
+        f"error: {error_text}\n"
+        f"url: {url}\n"
+        f"title: {title}\n"
+        f"password_gate_detected: {password_gate}\n"
+        f"totp_input_visible: {totp_visible}\n"
+        f"old_password: {old_password or '<empty>'}\n"
+        f"new_password: {new_password or '<not-created>'}\n"
+        f"password_used_for_reauth: {password_used_for_reauth or '<unknown>'}\n"
+        f"screenshot_path: {screenshot_path or '<none>'}\n"
+        f"html_path: {html_path or '<none>'}\n\n"
+        "body_excerpt:\n"
+        f"{body_excerpt}\n"
+    )
+    solution_text = (
+        "Suggested recovery logic\n"
+        "1. If Google shows 'Enter your password' / 'Verify it's you', try the NEW password first.\n"
+        "2. If the new password is rejected, retry once with the OLD password.\n"
+        "3. After the password challenge clears, wait again for the Authenticator code field.\n"
+        "4. If the code field is still missing, click Next again or switch through 'Try another way' to Authenticator.\n"
+        "5. Use the attached screenshot + HTML dump + this report to inspect the exact blocker page.\n"
+    )
+
+    out: Dict[str, Optional[str]] = {"problem_txt_path": None, "solution_txt_path": None}
+    try:
+        with open(problem_path, "w", encoding="utf-8") as f:
+            f.write(problem_text)
+        out["problem_txt_path"] = problem_path
+    except Exception as exc:
+        log.warning("Problem debug txt write failed: %s", exc)
+    try:
+        with open(solution_path, "w", encoding="utf-8") as f:
+            f.write(solution_text)
+        out["solution_txt_path"] = solution_path
+    except Exception as exc:
+        log.warning("Solution debug txt write failed: %s", exc)
+    return out
+
+
 async def _hd(min_s: float = 0.4, max_s: float = 1.4) -> None:
     await asyncio.sleep(random.uniform(min_s * _SPEED, max_s * _SPEED))
 
@@ -1589,6 +1697,8 @@ async def _setup_new_authenticator(
     async def _snap(tag: str) -> None:
         await _shoot(page, user_id, tag, on_screenshot)
 
+    password_candidates = [p for p in [current_password, old_password] if p]
+
     await on_progress("step:open_2fa_settings")
     await page.goto(
         "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
@@ -1855,6 +1965,7 @@ async def _setup_new_authenticator(
     code_field_found = False
     for attempt in range(3):
         try:
+            await _reauth_if_needed(page, password_candidates, timeout_ms=6_000, on_password_used=on_password_used)
             await page.wait_for_selector(code_sel, timeout=10_000, state="visible")
             code_field_found = True
             log.info("TOTP code field appeared (attempt %d)", attempt + 1)
@@ -1862,6 +1973,27 @@ async def _setup_new_authenticator(
         except Exception:
             log.warning("TOTP code field not visible (attempt %d/3)", attempt + 1)
             await _snap(f"totp_field_missing_attempt{attempt + 1}")
+            try:
+                body_now = (await page.inner_text("body")).lower()
+            except Exception:
+                body_now = ""
+            if _looks_like_password_challenge(body_now, page.url):
+                log.info("Authenticator flow hit password challenge on attempt %d", attempt + 1)
+                reauthed = await _reauth_if_needed(
+                    page,
+                    password_candidates,
+                    timeout_ms=15_000,
+                    on_password_used=on_password_used,
+                )
+                await _hd(1.5, 2.5)
+                if reauthed:
+                    try:
+                        await page.wait_for_selector(code_sel, timeout=8_000, state="visible")
+                        code_field_found = True
+                        log.info("TOTP code field appeared after password recovery")
+                        break
+                    except Exception:
+                        log.info("Password recovery succeeded but TOTP input still not visible yet")
             # Retry: maybe Next wasn't actually clicked — try again
             if attempt < 2:
                 if await _click_text(page, ["next", "التالي"], 3000):
@@ -1896,7 +2028,7 @@ async def _setup_new_authenticator(
 
 
 async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
-                          on_progress: ProgressCallback) -> bool:
+                          on_progress: ProgressCallback, old_password: str = "") -> bool:
     """Sign out, sign back in with the new credentials, and confirm 2FA works
     without any user interaction. Handles passkey/device-tap automatically."""
     await on_progress("step:verify_new_2fa")
@@ -1937,6 +2069,8 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
         'input[autocomplete="one-time-code"]'
     )
 
+    password_candidates = [p for p in [new_password, old_password] if p]
+
     # Try password field first (normal flow)
     try:
         pwd_loc = await _wait_for_visible_locator(
@@ -1948,20 +2082,20 @@ async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
             ],
             timeout_ms=10_000,
         )
-        await pwd_loc.click()
-        await _hd(0.3, 0.8)
-        await pwd_loc.type(new_password, delay=random.randint(30, 90))
-        pwd_next = page.locator("#passwordNext").first
-        if await pwd_next.count() == 0:
-            pwd_next = page.get_by_role("button", name="Next")
-        if await pwd_next.count() > 0:
-            await pwd_next.click()
-        else:
-            await page.keyboard.press("Enter")
+        del pwd_loc
+        await _reauth_if_needed(page, password_candidates, timeout_ms=15_000)
         await _hd(2.5, 4)
     except Exception:
         # No password field — Google may have jumped straight to passkey/2FA
         log.info("No password field shown — proceeding to 2FA detection")
+
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if _looks_like_password_challenge(body, page.url):
+        await _reauth_if_needed(page, password_candidates, timeout_ms=15_000)
+        await _hd(1.5, 2.5)
 
     # Now handle whatever 2FA challenge appears: passkey, device-tap, or TOTP
     # _switch_to_totp_method handles passkey + device-tap + try-another-way
@@ -2054,10 +2188,13 @@ async def rotate_google_account(
         "gmail": gmail,
         "new_password": None,
         "new_totp_secret": None,
+        "password_used_for_reauth": None,
         "step": "launch_browser",
         "error": None,
         "screenshot_path": None,
         "html_path": None,
+        "problem_txt_path": None,
+        "solution_txt_path": None,
     }
 
     if not gmail or "@" not in gmail:
@@ -2136,6 +2273,7 @@ async def rotate_google_account(
         async def _notify_password_used(pwd_used: str) -> None:
             label = "new_password" if pwd_used == new_password else "old_password_still_active"
             log.info("Password actually used during reauth: %s", label)
+            result["password_used_for_reauth"] = pwd_used
             if on_credentials_ready is not None:
                 try:
                     await on_credentials_ready("password_used_for_reauth", pwd_used)
@@ -2153,7 +2291,7 @@ async def rotate_google_account(
         await _emit_credential("new_totp_secret", new_secret)
         await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
 
-        await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap)
+        await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
         await _shoot(page, user_id, "after_verify", on_screenshot)
 
         await _progress_wrap("step:done")
@@ -2169,6 +2307,19 @@ async def rotate_google_account(
             cap = await _capture(page, user_id, current_step)
             result["screenshot_path"] = cap["screenshot_path"]
             result["html_path"] = cap["html_path"]
+            txts = await _write_admin_debug_reports(
+                page,
+                user_id=user_id,
+                step=current_step,
+                error_text=result["error"],
+                screenshot_path=result.get("screenshot_path"),
+                html_path=result.get("html_path"),
+                old_password=old_password,
+                new_password=result.get("new_password") or "",
+                password_used_for_reauth=result.get("password_used_for_reauth") or "",
+            )
+            result["problem_txt_path"] = txts.get("problem_txt_path")
+            result["solution_txt_path"] = txts.get("solution_txt_path")
             # Also push the failure screenshot via the live callback
             if cap.get("screenshot_path") and on_screenshot is not None:
                 try:
