@@ -963,24 +963,89 @@ async def _click_turn_on_2sv(page) -> bool:
     return False
 
 
-async def _reauth_if_needed(page, current_password: str) -> None:
+async def _reauth_if_needed(page, current_password: str, timeout_ms: int = 12_000) -> bool:
     """If Google re-prompts for the password (common after clicking sensitive
-    settings buttons), fill it automatically using the password we just set."""
+    settings buttons or opening security pages like /signinoptions/...),
+    fill it automatically using the password passed in.
+
+    Args:
+        page: the playwright page
+        current_password: the password to enter (use the NEW password if it
+            was just changed, since that's now the account's active password)
+        timeout_ms: how long to wait for the password field to appear
+
+    Returns: True if re-auth was performed, False if no prompt was shown.
+    """
     pwd_sel = (
         'input[type="password"][name="Passwd"], '
         'input[type="password"]:not([name="hiddenPassword"])'
         ':not([aria-hidden="true"]):not([tabindex="-1"])'
     )
-    try:
-        await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
-    except Exception:
-        return  # No re-auth needed
+
+    # Detect re-auth via multiple signals (page text + URL + visible field)
+    deadline = time.time() + (timeout_ms / 1000.0)
+    detected = False
+    while time.time() < deadline:
+        # Signal 1: visible password field on the page
+        try:
+            loc = page.locator(pwd_sel).first
+            if await loc.count() and await loc.is_visible():
+                detected = True
+                break
+        except Exception:
+            pass
+        # Signal 2: URL contains a re-auth challenge path
+        try:
+            cur = page.url.lower()
+            if any(p in cur for p in [
+                "signin/challenge", "signin/v2/challenge", "challenge/pwd",
+                "/v3/signin/", "rejected",
+            ]):
+                # On challenge pages, wait for password field to render
+                try:
+                    await page.wait_for_selector(pwd_sel, timeout=3_000, state="visible")
+                    detected = True
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Signal 3: visible "Welcome" / "verify it's you" text
+        try:
+            body_text = (await page.inner_text("body")).lower()
+            if any(kw in body_text for kw in [
+                "to continue, first verify", "verify it's you", "verify it’s you",
+                "first verify it", "للمتابعة، تحقّق", "تحقق من هويتك",
+            ]):
+                # Wait a moment for the field to render
+                try:
+                    await page.wait_for_selector(pwd_sel, timeout=3_000, state="visible")
+                    detected = True
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    if not detected:
+        return False  # No re-auth needed
+
     log.info("Re-auth prompt detected — entering current password")
     try:
         loc = page.locator(pwd_sel).first
+        # Clear field first (in case Google pre-filled something)
+        try:
+            await loc.fill("")
+            await _hd(0.2, 0.4)
+        except Exception:
+            pass
         await loc.click()
         await _hd(0.3, 0.7)
-        await loc.type(current_password, delay=random.randint(40, 90))
+        # Type character by character (more human-like + safer)
+        for ch in current_password:
+            await page.keyboard.type(ch)
+            await asyncio.sleep(random.uniform(0.04, 0.12))
         await _hd(0.4, 0.8)
         nxt = page.locator("#passwordNext").first
         if await nxt.count() == 0:
@@ -989,9 +1054,15 @@ async def _reauth_if_needed(page, current_password: str) -> None:
             await nxt.click()
         else:
             await page.keyboard.press("Enter")
-        await _hd(2.5, 4)
+        await _hd(3, 5)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+        return True
     except Exception as exc:
         log.warning("Re-auth attempt failed: %s", exc)
+        return False
 
 
 async def _add_phone_number(
