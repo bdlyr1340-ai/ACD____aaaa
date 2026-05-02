@@ -935,14 +935,21 @@ async def _click_change_password_button(page) -> bool:
 
 
 async def _change_password(page, on_progress: ProgressCallback,
-                           old_password: str = "") -> str:
+                           old_password: str = "",
+                           custom_new_password: str = "") -> str:
     await on_progress("step:open_security_page")
-    # Use fixed password from env var or hard-coded default
-    new_pwd = os.environ.get("NEW_PASSWORD", DEFAULT_NEW_PASSWORD).strip()
-    if not new_pwd or len(new_pwd) < 8:
-        log.warning("NEW_PASSWORD too short, falling back to default")
-        new_pwd = DEFAULT_NEW_PASSWORD
-    log.info("Using fixed password (len=%d)", len(new_pwd))
+    # الأولوية: 1) custom_new_password (تم تعيينه من البوت)
+    #          2) ENV NEW_PASSWORD
+    #          3) DEFAULT_NEW_PASSWORD
+    if custom_new_password and len(custom_new_password) >= 8:
+        new_pwd = custom_new_password.strip()
+        log.info("Using custom password from bot (len=%d)", len(new_pwd))
+    else:
+        new_pwd = os.environ.get("NEW_PASSWORD", DEFAULT_NEW_PASSWORD).strip()
+        if not new_pwd or len(new_pwd) < 8:
+            log.warning("NEW_PASSWORD too short, falling back to default")
+            new_pwd = DEFAULT_NEW_PASSWORD
+        log.info("Using fixed password (len=%d)", len(new_pwd))
 
     await page.goto(
         "https://myaccount.google.com/signinoptions/password?hl=en",
@@ -1919,19 +1926,17 @@ async def _setup_new_authenticator(
     log.info("Extracted new TOTP secret (len=%d)", len(secret))
     await _snap("totp_secret_extracted")
 
-    # ── EMIT credentials to user IMMEDIATELY (before risky TOTP submission) ──
-    # نرسل للمستخدم المفتاح + الرابط + الرمز فوراً، حتى لو فشل أي شيء بعدها
-    # المستخدم يكون قد استلم كل البيانات.
+    # ── إرسال المفتاح + الرابط + الرمز للمستخدم فوراً ──
+    tfa_url = f"https://2fa.fb.tools/{secret}"
     if on_credentials_ready is not None:
-        try:
-            await on_credentials_ready("new_totp_secret", secret)
-        except Exception as exc:
-            log.warning("emit new_totp_secret failed: %s", exc)
-        try:
-            tfa_url = f"https://2fa.fb.tools/{secret}"
-            await on_credentials_ready("totp_url", tfa_url)
-        except Exception as exc:
-            log.warning("emit totp_url failed: %s", exc)
+        for label, value in (
+            ("new_totp_secret", secret),
+            ("totp_url", tfa_url),
+        ):
+            try:
+                await on_credentials_ready(label, value)
+            except Exception as exc:
+                log.warning("emit %s failed: %s", label, exc)
         try:
             current_code = _now_totp(secret)
             await on_credentials_ready("totp_code", current_code)
@@ -2027,20 +2032,17 @@ async def _setup_new_authenticator(
                 await _hd(2.0, 3.0)
 
     if not code_field_found:
-        # حقل TOTP لم يظهر — لا نرفع خطأ. المفتاح + الرابط + الرمز
-        # تم إرسالها للمستخدم سابقاً. نعتبرها نجاح جزئي.
         try:
             log.warning("TOTP page never appeared. URL=%s, title=%s",
                         page.url, await page.title())
         except Exception:
             pass
         await _snap("totp_field_FAILED_but_secret_emitted")
-        log.warning("Secret already emitted — returning secret as partial success")
+        log.warning("Returning secret as partial success (user has secret/url/code)")
         return secret
 
-    # حاول إدخال رمز TOTP في Google — إذا فشل لا نرفع خطأ
+    # إدخال الرمز في Google — مع إعادة توليد كود طازج
     try:
-        # نولّد الرمز مجدداً (قد يكون انتهى الصلاحية بعد المحاولات)
         try:
             code = _now_totp(secret)
         except Exception:
@@ -2052,18 +2054,18 @@ async def _setup_new_authenticator(
         await _hd(3, 5)
         await _snap("totp_code_submitted")
 
-        # محاولة الضغط على "Done" / "Turn on" لتفعيل المصادقة الثنائية نهائياً
+        # تأكيد التفعيل النهائي: Done / Turn on / تفعيل
         for label in [
-            "done", "turn on", "save", "finish",
+            "done", "turn on", "save", "finish", "got it",
             "تم", "تفعيل", "حفظ", "إنهاء", "موافق",
         ]:
             if await _click_text(page, [label], 2500):
                 await _hd(1.0, 2.0)
                 break
         await _snap("after_2sv_finalized")
-        log.info("2FA setup finalized successfully")
+        log.info("2FA finalized successfully")
     except Exception as exc:
-        log.warning("Submitting TOTP/finalizing 2SV failed (non-fatal): %s", exc)
+        log.warning("TOTP submit/finalize failed (non-fatal): %s", exc)
         await _snap("totp_submit_failed_nonfatal")
     return secret
 
@@ -2198,6 +2200,7 @@ async def rotate_google_account(
     sms_code_provider: Optional[SmsCodeProvider] = None,
     on_screenshot: Optional[ScreenshotCallback] = None,
     on_credentials_ready: Optional[CredentialsCallback] = None,
+    custom_new_password: str = "",
 ) -> Dict[str, Any]:
     """Rotate a Google account's password and 2FA secret.
 
@@ -2304,13 +2307,14 @@ async def rotate_google_account(
         page = page_holder["page"]  # may have been swapped
         await _shoot(page, user_id, "after_login", on_screenshot)
 
-        new_password = await _change_password(page, _progress_wrap, old_password)
+        new_password = await _change_password(
+            page, _progress_wrap, old_password,
+            custom_new_password=custom_new_password,
+        )
         result["new_password"] = new_password
-        # Send the new password to the user IMMEDIATELY
         await _emit_credential("new_password", new_password)
         await _shoot(page, user_id, "after_change_password", on_screenshot)
 
-        # Build a callback that tells the user which password worked
         async def _notify_password_used(pwd_used: str) -> None:
             label = "new_password" if pwd_used == new_password else "old_password_still_active"
             log.info("Password actually used during reauth: %s", label)
@@ -2334,14 +2338,13 @@ async def rotate_google_account(
             result["totp_code"] = _now_totp(new_secret)
         except Exception:
             result["totp_code"] = None
-        # Send 2FA secret + URL + code IMMEDIATELY (in case callback above missed)
         await _emit_credential("new_totp_secret", new_secret)
         await _emit_credential("totp_url", result["totp_url"])
         if result.get("totp_code"):
             await _emit_credential("totp_code", result["totp_code"])
         await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
 
-        # verify غير قاتل: المستخدم استلم كل البيانات بالفعل
+        # verify غير قاتل
         try:
             await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
             await _shoot(page, user_id, "after_verify", on_screenshot)
