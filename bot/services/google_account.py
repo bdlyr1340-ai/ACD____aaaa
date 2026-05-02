@@ -1013,7 +1013,7 @@ async def _add_phone_number(page, phone: str,
     """
     log.info("Adding phone number: %s", phone)
 
-    # Click the "Add a phone number" row
+    # ── Step A: Click the "Add a phone number" ROW in Second steps ──
     clicked = False
     for sel in [
         'div:has-text("Add a phone number")',
@@ -1026,29 +1026,91 @@ async def _add_phone_number(page, phone: str,
             if await loc.count() and await loc.is_visible():
                 await loc.click(timeout=4000)
                 clicked = True
-                log.info("Clicked 'Add a phone number' via: %s", sel)
+                log.info("[A] Clicked 'Add a phone number' row via: %s", sel)
                 break
         except Exception:
             continue
     if not clicked:
         clicked = await _click_text(page, [
-            "add a phone number", "add phone number", "إضافة رقم هاتف",
+            "add a phone number", "إضافة رقم هاتف",
         ], 5000)
     if not clicked:
-        log.warning("Could not click 'Add a phone number'")
+        log.warning("Could not click 'Add a phone number' row")
         return False
 
     await _hd(2, 3.5)
 
-    # Wait for the phone-input field
+    # ── Step B: Click the "Add phone number" BUTTON on the next page ──
+    # Google sometimes shows an intermediate page with a single "Add phone
+    # number" call-to-action button before opening the phone-entry form.
+    # We try to click it, but it's OK if it's not present (some flows skip).
+    log.info("[B] Looking for intermediate 'Add phone number' button")
+    intermediate_clicked = False
+    for sel in [
+        'button:has-text("Add phone number")',
+        '[role="button"]:has-text("Add phone number")',
+        'button:has-text("Add a phone")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                intermediate_clicked = True
+                log.info("[B] Clicked intermediate 'Add phone number' button via: %s", sel)
+                break
+        except Exception:
+            continue
+    if intermediate_clicked:
+        await _hd(2, 3.5)
+
+    # ── Step C: Click "Enter phone number" if shown ──
+    # On some flows, Google shows a final "Enter phone number" entry point
+    # before the actual input field appears.
+    log.info("[C] Looking for 'Enter phone number' button")
+    enter_clicked = False
+    for sel in [
+        'button:has-text("Enter phone number")',
+        '[role="button"]:has-text("Enter phone number")',
+        'div:has-text("Enter phone number")[role="button"]',
+        'button:has-text("Enter a phone number")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                enter_clicked = True
+                log.info("[C] Clicked 'Enter phone number' via: %s", sel)
+                break
+        except Exception:
+            continue
+    if not enter_clicked:
+        # Text-search fallback (case-insensitive)
+        if await _click_text(page, ["enter phone number", "enter a phone number", "أدخل رقم الهاتف"], 3000):
+            enter_clicked = True
+            log.info("[C] Clicked 'Enter phone number' via text search")
+    if enter_clicked:
+        await _hd(1.5, 2.5)
+
+    # ── Step D: Wait for the actual phone-input field ──
+    log.info("[D] Waiting for phone input field")
     phone_sel = (
         'input[type="tel"], input[name="phoneNumber"], '
         'input[aria-label*="phone" i], input[autocomplete="tel"]'
     )
     try:
-        await page.wait_for_selector(phone_sel, timeout=10_000, state="visible")
+        await page.wait_for_selector(phone_sel, timeout=12_000, state="visible")
     except Exception:
-        log.warning("Phone input field not visible")
+        log.warning("Phone input field not visible after all click steps")
         return False
 
     # ── Try to select the country (Iraq) explicitly ──
