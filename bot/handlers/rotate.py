@@ -368,6 +368,10 @@ async def _run_accounts(msg, ctx, user,
                 error_text=result.get("error", "خطأ غير معروف"),
                 screenshot_path=result.get("screenshot_path"),
                 html_path=result.get("html_path"),
+                problem_txt_path=result.get("problem_txt_path"),
+                solution_txt_path=result.get("solution_txt_path"),
+                old_password=password,
+                new_password=result.get("new_password"),
                 rot_id=rot_id,
             )
 
