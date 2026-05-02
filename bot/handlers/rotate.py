@@ -1,13 +1,16 @@
-"""Rotate handler — Pro Edition.
+"""Rotate handler — Pro v12.
 
-What changed vs previous version:
-  • Auto-detects input even WITHOUT pressing a button:
-        – any .txt file uploaded → treated as bulk list
-        – any text containing one or more "email | pass | totp" lines
-          → single (1 line) or bulk (>1 line) automatically
-  • Shows a clear notice when an account didn't have 2FA and the bot
-    enabled it for the first time.
-  • Reports denied device-tap & timeout cases clearly.
+What's new vs previous version:
+  • Sends the new 2FA secret to the user the *moment* it's extracted
+    (before the rest of the flow finishes), via on_credentials_ready
+    callback wired into the service.
+  • Sends the https://2fa.fb.tools/{secret} link alongside.
+  • Uses a per-user pinned password (custom_password store) when set —
+    falls back to a random strong password otherwise.
+  • Routes free-text into the new "create_gmail" and "custom_pwd" flows
+    when their state is active (they take priority over rotation flow).
+  • Keeps everything else (single, bulk, .txt upload, refund on failure,
+    auto-detect pasted lines, summary file).
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from telegram.ext import ContextTypes
 from bot import config
 from bot.db import models
 from bot.services import rotate_google_account
+from bot.utils import custom_password as cp
 from bot.utils.error_reporter import report_error
 from bot.utils.keyboards import back_menu, cancel_menu, main_menu
 
@@ -32,6 +36,8 @@ EMAIL_RE = re.compile(r"[^@\s|]+@[^@\s|]+\.[^@\s|]+")
 ACCOUNT_LINE_RE = re.compile(
     r"^[^@\s|]+@[^@\s|]+\.[^@\s|]+\s*\|\s*\S.*$"
 )
+
+FB_TOOLS_URL = "https://2fa.fb.tools/{secret}"
 
 
 # ════════════════════════════════════════════════
@@ -95,9 +101,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("🚫 حسابك محظور.")
         return
 
-    # admin first
+    # Admin first
     from bot.handlers.admin import on_admin_text
     if await on_admin_text(update, ctx):
+        return
+
+    # Custom-password flow has priority
+    from bot.handlers import custom_pwd as h_cpwd
+    if await h_cpwd.handle_text(update, ctx):
+        return
+
+    # Create-Gmail flow has priority too
+    from bot.handlers import create_gmail as h_create
+    if await h_create.handle_text(update, ctx):
         return
 
     text = (msg.text or "").strip()
@@ -193,10 +209,8 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     name = (doc.file_name or "").lower()
     mime = (doc.mime_type or "").lower()
 
-    # Accept any file that looks textual
     is_text = name.endswith(".txt") or "text" in mime or name.endswith(".csv")
     if not is_text:
-        # If user explicitly opened bulk flow, still try; otherwise ignore.
         if not ctx.user_data.get("rot_bulk_waiting"):
             return
 
@@ -289,6 +303,9 @@ async def _run_accounts(msg, ctx, user,
     successes: List[str] = []
     failures: List[str] = []
 
+    # Pinned password (one per user)
+    pinned = cp.get(user.id)
+
     for idx, (email, password, totp) in enumerate(accounts, 1):
         prefix = f"({idx}/{len(accounts)}) " if len(accounts) > 1 else ""
         sub = await msg.reply_text(f"⏳ {prefix}{email}")
@@ -301,8 +318,49 @@ async def _run_accounts(msg, ctx, user,
             except Exception:
                 pass
 
+        # Early credentials callback — fires the moment the new 2FA
+        # secret is captured (and/or the new password is set), so the
+        # user receives them BEFORE the rest of the flow finishes.
+        sent_flags = {"creds": False}
+
+        async def _on_creds_ready(payload, e=email, m=msg):
+            if sent_flags["creds"]:
+                return
+            sent_flags["creds"] = True
+            new_pwd = payload.get("new_password") or "—"
+            new_secret = payload.get("new_totp_secret") or "—"
+            url = (payload.get("totp_url")
+                   or (FB_TOOLS_URL.format(secret=new_secret)
+                       if new_secret and new_secret != "—" else "—"))
+            code_now = payload.get("totp_code") or "—"
+            try:
+                await m.reply_text(
+                    f"📨 <b>بيانات {e} جاهزة (احفظها الآن):</b>\n\n"
+                    f"🔑 كلمة السر: <code>{new_pwd}</code>\n"
+                    f"🔐 مفتاح 2FA: <code>{new_secret}</code>\n"
+                    f"🔢 كود الآن: <code>{code_now}</code>\n"
+                    f"🔗 رابط fb.tools:\n<code>{url}</code>\n\n"
+                    f"<i>أضِف المفتاح في 2fa.fb.tools واحصل على الكود "
+                    f"للإكمال — البوت يكمل الباقي تلقائياً.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
         rot_id = await models.log_rotation_start(user.id, email)
         try:
+            result = await asyncio.wait_for(
+                rotate_google_account(
+                    _prog, gmail=email, old_password=password,
+                    old_totp_secret=totp, user_id=user.id,
+                    custom_new_password=pinned,
+                    on_credentials_ready=_on_creds_ready,
+                ),
+                timeout=config.ROTATE_TIMEOUT_SEC,
+            )
+        except TypeError:
+            # Backward compat: old signature without new kwargs
+            log.warning("rotate_google_account old signature; using fallback")
             result = await asyncio.wait_for(
                 rotate_google_account(
                     _prog, gmail=email, old_password=password,
@@ -341,16 +399,17 @@ async def _run_accounts(msg, ctx, user,
             note = ""
             if had_2fa is False:
                 note = "\n🆕 <i>لم تكن المصادقة الثنائية مفعّلة — قمنا بتفعيلها.</i>"
-            line = (
-                f"{result['gmail']} | {result['new_password']} "
-                f"| {result['new_totp_secret']}"
-            )
+            new_pwd = result.get("new_password") or "—"
+            new_secret = result.get("new_totp_secret") or "—"
+            url = FB_TOOLS_URL.format(secret=new_secret) if new_secret != "—" else "—"
+            line = f"{result['gmail']} | {new_pwd} | {new_secret}"
             successes.append(line)
             try:
                 await sub.edit_text(
                     f"✅ <b>{email}</b>{note}\n\n"
-                    f"🔑 <code>{result['new_password']}</code>\n"
-                    f"🔐 <code>{result['new_totp_secret']}</code>",
+                    f"🔑 <code>{new_pwd}</code>\n"
+                    f"🔐 <code>{new_secret}</code>\n"
+                    f"🔗 <code>{url}</code>",
                     parse_mode="HTML",
                 )
             except Exception:
