@@ -1,14 +1,15 @@
-"""Google Account Rotator — Camoufox edition (FIXED v2026).
+"""Google Account Rotator — Camoufox edition.
 
 Public entry point:
     rotate_google_account(on_progress, gmail, old_password, old_totp_secret, user_id)
 
-Changes from previous version:
-  1. _change_password generates a RANDOM password.
-  2. _setup_new_authenticator adds phone INSIDE 2-Step Verification page FIRST.
-  3. Sends secret + url + code to user IMMEDIATELY after extraction.
-  4. Returns back to the main 2SV page to click the blue "Turn on" button.
-  5. MAINTAINED all 1000+ lines of stealth, proxy, and debugging logic.
+This rewrite restores the techniques from the original (working) version:
+- Camoufox first, Patchright second, Playwright Chromium last.
+- Heavy stealth JS + realistic UA rotation.
+- "Warmup" visit to google.com before sign-in (builds cookies, looks human).
+- Random mouse movements + per-character typing delay.
+- Robust password-field detection that ignores Google's hidden trap fields.
+- Detects "Couldn't sign you in" and retries with a fresh page.
 """
 from __future__ import annotations
 
@@ -39,7 +40,11 @@ DEFAULT_FALLBACK_PHONE = "+9647728257333"
 
 async def _shoot(page, user_id: int, tag: str,
                  on_screenshot: Optional[ScreenshotCallback] = None) -> None:
-    """Capture a screenshot and notify the caller via callback (if provided)."""
+    """Capture a screenshot and notify the caller via callback (if provided).
+
+    Used to send progress screenshots to the Telegram user after every step,
+    so they can debug what the bot is seeing. Failures are non-fatal.
+    """
     if page is None:
         return
     try:
@@ -170,16 +175,10 @@ def _looks_like_password_challenge(body_text: str, url: str = "") -> bool:
         "to continue, first verify",
         "first verify that it's you",
         "first verify that it’s you",
-        "first verify that its you",
-        "first verify it",
-        "verify that it's you",
-        "verify that it’s you",
-        "verify that its you",
         "verify it's you",
         "verify it’s you",
-        "welcome",
         "enter your password",
-        # Arabic
+        "welcome",
         "للمتابعة، تحقّق",
         "تحقق من هويتك",
         "تأكّد من هويتك",
@@ -302,7 +301,8 @@ async def _type_human_at(page, selector: str, text: str) -> None:
 
 
 async def _wait_for_visible_locator(page, selectors: List[str], timeout_ms: int = 20_000):
-    """Return the first truly-visible locator, ignoring Google's hidden traps."""
+    """Return the first truly-visible locator, ignoring Google's hidden traps
+    (hiddenPassword / aria-hidden=true / tabindex=-1)."""
     deadline = time.time() + (timeout_ms / 1000.0)
     last_error = None
     while time.time() < deadline:
@@ -355,7 +355,13 @@ async def _click_text(page, substrings: List[str], timeout_ms: int = 4000) -> bo
 
 
 async def _handle_passkey_screen(page) -> bool:
-    """If Google shows 'Use your passkey', click it then fall through to TOTP."""
+    """If Google shows 'Use your passkey', click it then fall through to TOTP.
+
+    The user wants the bot to press 'Use your passkey' first, then switch
+    to the Authenticator code (TOTP) flow. After clicking the passkey button,
+    Google usually shows a system prompt that we cannot satisfy headlessly,
+    so we click 'Try another way' to reach the Authenticator option.
+    """
     try:
         body = (await page.inner_text("body")).lower()
     except Exception:
@@ -372,6 +378,7 @@ async def _handle_passkey_screen(page) -> bool:
         "use your passkey", "use passkey", "استخدم مفتاح المرور", "مفتاح المرور",
     ], 4000)
     if not clicked:
+        # Try button selectors directly
         for sel in [
             'button:has-text("Use your passkey")',
             'button:has-text("passkey")',
@@ -388,6 +395,7 @@ async def _handle_passkey_screen(page) -> bool:
 
     if clicked:
         await _hd(2, 3.5)
+        # After passkey prompt fails (we're headless, no security key), pick TOTP
         await _click_text(page, [
             "try another way", "طريقة أخرى", "جرب طريقة",
             "use a different method", "use another method",
@@ -403,6 +411,7 @@ async def _handle_passkey_screen(page) -> bool:
 
 async def _switch_to_totp_method(page) -> bool:
     """Handle device-tap, passkey, and other 2FA prompts to land on TOTP input."""
+    # Passkey screen first
     if await _handle_passkey_screen(page):
         return True
 
@@ -441,6 +450,7 @@ async def _warmup_google(page) -> None:
         consent = page.locator(
             "button:has-text('Accept all'), "
             "button:has-text('Accept'), "
+            "button:has-text('I agree'), "
             "button:has-text('Reject all')"
         )
         if await consent.count() > 0:
@@ -798,7 +808,14 @@ async def _do_login(page_holder: Dict[str, Any], gmail: str, old_password: str,
 # ---------------------------------------------------------------------------
 
 async def _confirm_change_password_dialog(page) -> bool:
-    """Click the 'Change password' button inside Google's confirmation dialog."""
+    """Click the 'Change password' button inside Google's confirmation dialog.
+
+    After clicking the first 'Change password' button, Google shows a modal
+    dialog ("You'll stay signed in on these devices after changing your
+    password") with two buttons: 'Cancel' and 'Change password'. We need
+    to click the second one to actually commit the change.
+    """
+    # Wait briefly for the dialog to appear
     dialog_indicators = [
         '[role="dialog"]',
         '[role="alertdialog"]',
@@ -815,11 +832,13 @@ async def _confirm_change_password_dialog(page) -> bool:
             continue
 
     if not dialog_found:
+        # Maybe Google submitted directly without a dialog — that's fine
         log.info("No confirmation dialog appeared (may have submitted directly)")
         return False
 
     await _hd(0.5, 1.2)
 
+    # Try to click "Change password" inside the dialog specifically
     dialog_button_selectors = [
         '[role="dialog"] button:has-text("Change password")',
         '[role="alertdialog"] button:has-text("Change password")',
@@ -840,8 +859,10 @@ async def _confirm_change_password_dialog(page) -> bool:
             log.debug("Dialog selector %s failed: %s", sel, exc)
             continue
 
+    # Fallback: scope to dialog then text-search inside it
     try:
         dlg = page.locator('[role="dialog"], [role="alertdialog"], div[aria-modal="true"]').first
+        # Look for any button inside the dialog whose text matches
         btns = dlg.locator('button, [role="button"]')
         count = await btns.count()
         for i in range(count):
@@ -853,6 +874,7 @@ async def _confirm_change_password_dialog(page) -> bool:
                 if any(kw in txt for kw in [
                     "change password", "change", "تغيير", "ok", "confirm", "تأكيد",
                 ]):
+                    # Skip cancel buttons
                     if "cancel" in txt or "إلغاء" in txt:
                         continue
                     await btn.click(timeout=4000)
@@ -868,7 +890,13 @@ async def _confirm_change_password_dialog(page) -> bool:
 
 
 async def _click_change_password_button(page) -> bool:
-    """Try multiple strategies to click the 'Change password' button reliably."""
+    """Try multiple strategies to click the 'Change password' button reliably.
+
+    Google sometimes renders this button as <button>, sometimes as a div with
+    role=button, and the visible text varies (Change password / تغيير / Save).
+    We try locators in order and return on first success.
+    """
+    # Strategy 1: button with exact visible text (English)
     selectors = [
         'button:has-text("Change password")',
         'button:has-text("Change Password")',
@@ -876,12 +904,14 @@ async def _click_change_password_button(page) -> bool:
         'button:has-text("Save")',
         '[role="button"]:has-text("Change password")',
         '[role="button"]:has-text("تغيير كلمة المرور")',
+        # Google's Material button class fallback
         'button[jsname]:has-text("Change")',
     ]
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() and await loc.is_visible():
+                # Scroll into view first (the button can be below fold)
                 try:
                     await loc.scroll_into_view_if_needed(timeout=2000)
                 except Exception:
@@ -894,6 +924,7 @@ async def _click_change_password_button(page) -> bool:
             log.debug("Selector %s failed: %s", sel, exc)
             continue
 
+    # Strategy 2: text-based xpath (case-insensitive)
     if await _click_text(page, [
         "change password", "تغيير كلمة المرور", "تغيير كلمة السر", "save", "حفظ",
     ], 5000):
@@ -907,14 +938,18 @@ async def _change_password(page, on_progress: ProgressCallback,
                            old_password: str = "",
                            custom_new_password: str = "") -> str:
     await on_progress("step:open_security_page")
-    
-    # Generate random password
+    # الأولوية: 1) custom_new_password (تم تعيينه من البوت)
+    #          2) ENV NEW_PASSWORD
+    #          3) DEFAULT_NEW_PASSWORD
     if custom_new_password and len(custom_new_password) >= 8:
         new_pwd = custom_new_password.strip()
-        log.info("Using custom password from bot")
+        log.info("Using custom password from bot (len=%d)", len(new_pwd))
     else:
-        new_pwd = _generate_strong_password(16)
-        log.info("Generated random password")
+        new_pwd = os.environ.get("NEW_PASSWORD", DEFAULT_NEW_PASSWORD).strip()
+        if not new_pwd or len(new_pwd) < 8:
+            log.warning("NEW_PASSWORD too short, falling back to default")
+            new_pwd = DEFAULT_NEW_PASSWORD
+        log.info("Using fixed password (len=%d)", len(new_pwd))
 
     await page.goto(
         "https://myaccount.google.com/signinoptions/password?hl=en",
@@ -922,9 +957,14 @@ async def _change_password(page, on_progress: ProgressCallback,
     )
     await _hd(2, 3.5)
 
+    # Google often shows a "verify it's you" / Welcome page before allowing
+    # password changes. Detect and handle it using the OLD password (because
+    # we haven't changed it yet at this point).
     if old_password:
-        await _reauth_if_needed(page, old_password, timeout_ms=15_000)
-        await _hd(2, 3)
+        reauth_done = await _reauth_if_needed(page, old_password, timeout_ms=15_000)
+        if reauth_done:
+            log.info("Re-auth completed before password change")
+            await _hd(2, 3)
 
     pwd_sel = 'input[type="password"]'
     try:
@@ -941,188 +981,166 @@ async def _change_password(page, on_progress: ProgressCallback,
     if n < 2:
         raise RuntimeError("حقول كلمة السر الجديدة غير ظاهرة")
 
+    # Fill new password (field #1) using fill() for guaranteed exact value
+    # Then verify by reading the value back. This avoids the "Passwords don't
+    # match" error that happens when keyboard.type() drops characters or the
+    # focus jumps between fields mid-typing.
+    log.info("Filling new password into both fields")
+
     async def _fill_and_verify(field_index: int) -> bool:
+        """Fill field N with new_pwd, verify, retry once if mismatch."""
         for attempt in range(2):
             try:
                 f = fields.nth(field_index)
                 await f.click()
+                await _hd(0.2, 0.4)
+                # Clear first
                 await f.fill("")
-                await f.type(new_pwd, delay=70)
+                await _hd(0.15, 0.3)
+                # Use fill() — sets value atomically, no focus issues
+                await f.fill(new_pwd)
+                await _hd(0.3, 0.6)
+                # Verify the field actually contains what we set
                 actual = await f.input_value()
                 if actual == new_pwd:
+                    log.info("Field #%d filled correctly (len=%d)", field_index, len(actual))
                     return True
-            except:
-                pass
-            await _hd(0.5, 1.0)
+                log.warning("Field #%d mismatch (got len=%d, expected %d) — retrying",
+                            field_index, len(actual), len(new_pwd))
+            except Exception as exc:
+                log.warning("Field #%d fill attempt %d failed: %s", field_index, attempt, exc)
+                await _hd(0.5, 1.0)
         return False
 
     if not await _fill_and_verify(0):
         raise RuntimeError("تعذّر ملء حقل كلمة السر الجديدة بشكل صحيح")
+    await _hd(0.4, 0.8)
     if not await _fill_and_verify(1):
         raise RuntimeError("تعذّر ملء حقل تأكيد كلمة السر بشكل صحيح")
+    await _hd(0.6, 1.2)
 
-    await _click_change_password_button(page)
+    # Tab out so Google validates the strength meter
+    try:
+        await page.keyboard.press("Tab")
+    except Exception:
+        pass
+    await _hd(0.8, 1.6)
+
+    # Click "Change password" — try several strategies
+    clicked = await _click_change_password_button(page)
+    if not clicked:
+        # Last-resort: focus confirm field and press Enter
+        try:
+            await fields.nth(1).click()
+            await _hd(0.2, 0.4)
+            await page.keyboard.press("Enter")
+            log.info("Submitted via Enter key (fallback)")
+        except Exception as exc:
+            raise RuntimeError(f"تعذّر الضغط على زر Change password: {exc}")
+
+    # Google now shows a confirmation DIALOG ("You'll stay signed in on these
+    # devices...") that has its own "Change password" button. We must click it
+    # too, otherwise the password won't actually be changed.
     await _hd(1.5, 2.5)
     await _confirm_change_password_dialog(page)
-    await _hd(3, 5)
 
-    return new_pwd
+    # Wait for the page to react (URL change / success banner)
+    await _hd(3, 5)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        pass
+
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if any(k in body for k in [
+        "password changed", "password was changed", "تم تغيير", "تم الحفظ",
+    ]):
+        log.info("Password change confirmed via banner")
+        return new_pwd
+    if "/signinoptions/password" not in page.url:
+        log.info("Password change confirmed via URL change: %s", page.url)
+        return new_pwd
+
+    # One more wait + recheck — Google sometimes shows banner late
+    await _hd(2, 3)
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if any(k in body for k in ["password changed", "password was changed", "تم تغيير"]):
+        return new_pwd
+    if "/signinoptions/password" not in page.url:
+        return new_pwd
+
+    raise RuntimeError("تعذّر تأكيد تغيير كلمة السر")
 
 
 async def _click_turn_on_2sv(page) -> bool:
-    """Click 'Turn on 2-Step Verification' blue button if visible."""
+    """Click 'Turn on 2-Step Verification' button if visible.
+
+    This appears when 2SV is currently OFF. After clicking, Google may
+    re-prompt for the password before continuing. We handle that too.
+    """
     selectors = [
+        'button:has-text("Turn on 2-Step Verification")',
         'button:has-text("Turn on")',
-        'button:has-text("تفعيل")',
-        '[role="button"]:has-text("Turn on 2-Step Verification")',
-        'button:has-text("تفعيل التحقق")'
+        'button:has-text("تفعيل التحقّق")',
+        'button:has-text("تفعيل المصادقة")',
+        '[role="button"]:has-text("Turn on 2-Step")',
+        '[role="button"]:has-text("تفعيل")',
     ]
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
                 await loc.click(timeout=4000)
-                log.info("Turn on 2SV button clicked")
+                log.info("Clicked 'Turn on 2-Step Verification' via: %s", sel)
                 return True
-        except: continue
-    return await _click_text(page, ["turn on", "تفعيل", "Turn on 2-Step"], 5000)
+        except Exception:
+            continue
 
-
-# ════════════════════════════════════════════════════════════════════════
-# FIXED: Add phone number INSIDE 2-Step Verification page (Iraqi Fallback)
-# ════════════════════════════════════════════════════════════════════════
-
-async def _add_2sv_phone_number(page, phone: str, password: str, user_id: int, on_screenshot) -> bool:
-    log.info("Adding 2SV phone inside Google settings...")
-    
-    # Click "Add a phone number"
-    clicked = await _click_text(page, ["add a phone number", "إضافة رقم هاتف", "أضف رقم"], 5000)
-    if not clicked:
-        try:
-            await page.locator('div[role="button"]:has-text("Phone number")').first.click(timeout=3000)
-        except: pass
-
-    await _hd(2, 3)
-    await _reauth_if_needed(page, password)
-
-    phone_sel = 'input[type="tel"], input[name="phoneNumber"]'
-    try:
-        await page.wait_for_selector(phone_sel, timeout=10_000)
-        # Select Country: Iraq
-        try:
-            await page.locator('div[role="combobox"]').first.click(timeout=2000)
-            await page.keyboard.type("Iraq")
-            await page.keyboard.press("Enter")
-        except: pass
-        
-        await page.locator(phone_sel).fill("")
-        # Local part only
-        clean_num = phone.replace("+964", "").lstrip("0")
-        await page.locator(phone_sel).type(clean_num, delay=100)
-        await _hd(1, 2)
-        
-        if not await _click_text(page, ["next", "التالي"], 4000):
-            await page.keyboard.press("Enter")
-        
-        await _hd(4, 6)
+    if await _click_text(page, [
+        "turn on 2-step verification", "turn on 2-step", "turn on 2sv",
+        "تفعيل التحقّق بخطوتين", "تفعيل المصادقة الثنائية", "تفعيل التحقق",
+    ], 5000):
         return True
-    except:
-        return False
+    return False
 
-
-# ════════════════════════════════════════════════════════════════════════
-# FIXED: Setup Authenticator App with Immediate Emission
-# ════════════════════════════════════════════════════════════════════════
-
-async def _setup_new_authenticator(
-    page, on_progress: ProgressCallback, current_password: str,
-    sms_code_provider: Optional[SmsCodeProvider] = None,
-    *, on_screenshot: Optional[ScreenshotCallback] = None,
-    user_id: int = 0, old_password: str = "",
-    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
-    on_credentials_ready: Optional[CredentialsCallback] = None,
-) -> str:
-    
-    password_candidates = [p for p in [current_password, old_password] if p]
-
-    await on_progress("step:open_2fa_settings")
-    await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
-    await _hd(2, 3)
-    await _reauth_if_needed(page, password_candidates)
-
-    # 1. Add Phone FIRST if missing
-    body = (await page.inner_text("body")).lower()
-    if "add a phone number" in body or "إضافة رقم هاتف" in body:
-        await on_progress("step:add_phone_number")
-        await _add_2sv_phone_number(page, DEFAULT_FALLBACK_PHONE, current_password, user_id, on_screenshot)
-        await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
-        await _hd(2, 3)
-
-    # 2. Setup Authenticator
-    await on_progress("step:enable_new_authenticator")
-    await _click_text(page, ["Authenticator", "Add authenticator app", "تطبيق المصادقة"], 5000)
-    await _hd(2, 3)
-    await _click_text(page, ["Set up authenticator", "إعداد", "بدء"], 5000)
-    await _hd(2, 3)
-    await _reauth_if_needed(page, current_password)
-
-    # 3. Reveal Secret
-    await _click_text(page, ["Can't scan it", "لا يمكنك المسح", "Setup without QR"], 5000)
-    await _hd(1.5, 2.5)
-    
-    html = await page.content()
-    # Search for Google's format (32 chars spaced)
-    match = re.search(r"\b([A-Z2-7]{4}(?:\s[A-Z2-7]{4}){7,})\b", html.upper())
-    if not match:
-        raise RuntimeError("تعذّر استخراج مفتاح المصادقة من جوجل")
-    
-    secret = match.group(1).replace(" ", "").upper()
-    fb_tools_url = f"https://2fa.fb.tools/{secret}"
-    current_otp = _now_totp(secret)
-
-    # FIXED: Send IMMEDIATE emission to user
-    if on_credentials_ready:
-        try:
-            await on_credentials_ready("new_totp_secret", secret)
-            await on_credentials_ready("totp_url", fb_tools_url)
-            await on_credentials_ready("totp_code", current_otp)
-            log.info("Sent secret+url+code to user immediately after extraction.")
-        except Exception as e:
-            log.warning("Credential emission failed: %s", e)
-
-    # 4. Finalize Code Entry in Google
-    await _click_text(page, ["Next", "التالي"], 4000)
-    await _hd(2, 3)
-    code_sel = 'input[type="tel"], input#totpPin, input[autocomplete="one-time-code"]'
-    await page.wait_for_selector(code_sel, timeout=10_000)
-    await page.locator(code_sel).type(_now_totp(secret), delay=100)
-    await _hd(0.5, 1)
-    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 3000):
-        await page.keyboard.press("Enter")
-    await _hd(4, 5)
-
-    # 5. Final Step: Click the Blue "Turn On" Button
-    await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
-    await _hd(2, 3)
-    if await _click_turn_on_2sv(page):
-        await _hd(3, 4)
-        log.info("Final activation complete.")
-
-    return secret
-
-
-# ---------------------------------------------------------------------------
-# Re-auth helper (Full Definition Maintained)
-# ---------------------------------------------------------------------------
 
 async def _reauth_if_needed(
     page,
-    current_password,
+    current_password,  # str OR list of str (will try in order)
     timeout_ms: int = 25_000,
     *,
     on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> bool:
-    """If Google re-prompts for the password, fill it automatically."""
+    """If Google re-prompts for the password (common after clicking sensitive
+    settings buttons or opening security pages like /signinoptions/...),
+    fill it automatically using the password(s) passed in.
+
+    Args:
+        page: the playwright page
+        current_password: the password to enter, OR a list of passwords to
+            try in order. Useful when we're not sure if Google is asking for
+            the new password (just-changed) or still wants the old one.
+            Example: [new_password, old_password] tries new first, falls
+            back to old if Google rejects new.
+        timeout_ms: how long to wait for the password field to appear.
+        on_password_used: optional async callable invoked with the password
+            string that was successfully accepted. Use this to notify the
+            Telegram user which password ended up working.
+
+    Returns: True if re-auth was performed, False if no prompt was shown.
+    """
+    # Normalize to a list of candidates
     if isinstance(current_password, str):
         candidates = [current_password]
     else:
@@ -1136,44 +1154,130 @@ async def _reauth_if_needed(
         ':not([aria-hidden="true"]):not([tabindex="-1"])'
     )
 
+    # Detect re-auth via multiple signals (page text + URL + visible field)
+    # KEY INSIGHT: the most reliable signal is "a visible password field on
+    # any /signinoptions/, /accounts.google.com/v3/, or /signin/challenge URL".
+    # Text matching is unreliable because Google serves the UI in 50+ languages.
     deadline = time.time() + (timeout_ms / 1000.0)
     detected = False
     while time.time() < deadline:
+        # Signal 1 (PRIMARY): visible password field on the page
+        # This works regardless of UI language
         try:
             loc = page.locator(pwd_sel).first
             if await loc.count() and await loc.is_visible():
                 detected = True
+                log.info("Re-auth detected: password field visible (lang-agnostic)")
                 break
         except Exception:
             pass
+        # Signal 2: URL contains a re-auth challenge path
         try:
             cur = page.url.lower()
             if any(p in cur for p in [
                 "signin/challenge", "signin/v2/challenge", "challenge/pwd",
-                "/v3/signin/", "accounts.google.com/v3/signin",
+                "/v3/signin/", "rejected", "/signin/v2/sl/pwd",
+                "accounts.google.com/v3/signin",
             ]):
                 try:
                     await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
                     detected = True
+                    log.info("Re-auth detected via URL: %s", cur)
                     break
-                except: pass
-        except Exception: pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Signal 3: visible "Welcome" / "verify it's you" text in MANY languages
+        try:
+            body_text = (await page.inner_text("body")).lower()
+            if any(kw in body_text for kw in [
+                # English variants
+                "to continue, first verify",
+                "first verify that it's you",
+                "first verify that it’s you",
+                "first verify that its you",
+                "first verify it",
+                "verify that it's you",
+                "verify that it’s you",
+                "verify that its you",
+                "verify it's you",
+                "verify it’s you",
+                "welcome",
+                "enter your password",
+                # Arabic
+                "للمتابعة، تحقّق",
+                "تحقق من هويتك",
+                "تأكّد من هويتك",
+                "مرحباً",
+                "أدخل كلمة المرور",
+                # French
+                "bienvenue",
+                "veuillez confirmer votre identité",
+                "saisissez votre mot de passe",
+                "confirmer votre identité",
+                # Spanish
+                "te damos la bienvenida",
+                "verifica que eres tú",
+                "introduce tu contraseña",
+                # German
+                "willkommen",
+                "bestätige, dass du es bist",
+                "gib dein passwort ein",
+                # Portuguese
+                "bem-vindo",
+                "confirme que é você",
+                "digite sua senha",
+                # Italian
+                "benvenuto",
+                "verifica che sia tu",
+                # Turkish
+                "hoş geldin",
+                "kimliğini doğrula",
+                # Russian
+                "добро пожаловать",
+                "подтвердите, что это вы",
+                # Indonesian
+                "selamat datang",
+                # Hindi
+                "स्वागत है",
+            ]):
+                try:
+                    await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
+                    detected = True
+                    log.info("Re-auth detected via text keyword")
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
         await asyncio.sleep(0.5)
 
     if not detected:
-        return False
+        return False  # No re-auth needed
 
-    for pwd in candidates:
+    # Try each candidate password in order
+    for idx, pwd in enumerate(candidates):
+        label = f"#{idx+1} of {len(candidates)}"
+        log.info("Re-auth: trying password candidate %s (len=%d)", label, len(pwd))
         try:
             loc = page.locator(pwd_sel).first
             if not (await loc.count() and await loc.is_visible()):
+                # Field gone — assume success of previous attempt
+                log.info("Re-auth: password field disappeared — assuming success")
                 return True
-
-            await loc.fill("")
+            # Clear and fill
+            try:
+                await loc.fill("")
+                await _hd(0.2, 0.4)
+            except Exception:
+                pass
+            await loc.click()
             await _hd(0.3, 0.7)
-            await loc.type(pwd, delay=random.randint(40, 100))
+            for ch in pwd:
+                await page.keyboard.type(ch)
+                await asyncio.sleep(random.uniform(0.04, 0.12))
             await _hd(0.4, 0.8)
-
             nxt = page.locator("#passwordNext").first
             if await nxt.count() == 0:
                 nxt = page.get_by_role("button", name="Next")
@@ -1181,92 +1285,909 @@ async def _reauth_if_needed(
                 await nxt.click()
             else:
                 await page.keyboard.press("Enter")
-            await _hd(4, 6)
+            await _hd(3, 5)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
 
-            if not await page.locator(pwd_sel).first.is_visible(timeout=3000):
-                if on_password_used: await on_password_used(pwd)
+            # Check if password was accepted: field should be gone
+            still_there = page.locator(pwd_sel).first
+            field_visible = False
+            try:
+                if await still_there.count() and await still_there.is_visible():
+                    field_visible = True
+            except Exception:
+                pass
+
+            if not field_visible:
+                # Password accepted!
+                log.info("Re-auth SUCCESS with candidate %s", label)
+                if on_password_used is not None:
+                    try:
+                        await on_password_used(pwd)
+                    except Exception as exc:
+                        log.warning("on_password_used callback failed: %s", exc)
                 return True
-        except:
+
+            # Field still there — check if Google showed an error
+            try:
+                body = (await page.inner_text("body")).lower()
+            except Exception:
+                body = ""
+            rejected = any(kw in body for kw in [
+                "wrong password", "incorrect password", "couldn't verify",
+                "couldn’t verify", "كلمة المرور غير صحيحة", "غير صحيحة",
+                "password is incorrect",
+            ])
+            if rejected:
+                log.warning("Re-auth: password candidate %s REJECTED — trying next", label)
+                # Continue to next candidate
+                continue
+            else:
+                # Field still visible but no clear error — could be loading
+                log.warning("Re-auth: field still visible but no error msg — assuming success")
+                if on_password_used is not None:
+                    try:
+                        await on_password_used(pwd)
+                    except Exception:
+                        pass
+                return True
+
+        except Exception as exc:
+            log.warning("Re-auth attempt with %s failed: %s", label, exc)
             continue
+
+    log.warning("Re-auth: ALL %d password candidates failed", len(candidates))
     return False
 
 
+async def _add_phone_number(
+    page,
+    phone: str,
+    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    *,
+    on_screenshot: Optional[ScreenshotCallback] = None,
+    user_id: int = 0,
+) -> bool:
+    """Add a phone number via direct URL navigation.
+
+    Instead of clicking through the multi-step UI ("Add a phone number" →
+    "Add phone number" → "Enter phone number"), we navigate directly to
+    https://myaccount.google.com/phone which opens the phone management
+    page and shows the input field directly. This is much more reliable
+    because it bypasses ALL the intermediate buttons that change between
+    Google account types and UI versions.
+
+    Sequence:
+      1. goto https://myaccount.google.com/phone
+      2. Click "Add recovery phone" / "Add a phone number" if shown
+      3. Select country (Iraq) from dropdown
+      4. Type the number and click Next
+      5. Handle SMS code if requested
+    """
+    log.info("Adding phone via direct URL: %s", phone)
+
+    async def _snap(tag: str) -> None:
+        await _shoot(page, user_id, f"phone_{tag}", on_screenshot)
+
+    # ── Step 1: navigate to phone management page directly ──
+    phone_urls = [
+        "https://myaccount.google.com/phone?hl=en",
+        "https://myaccount.google.com/personal-info/phone?hl=en",
+    ]
+    loaded = False
+    for url in phone_urls:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            await _hd(2, 3.5)
+            loaded = True
+            log.info("Loaded phone page: %s", url)
+            break
+        except Exception as exc:
+            log.warning("Failed to load %s: %s", url, exc)
+    if not loaded:
+        await _snap("nav_failed")
+        return False
+    await _snap("1_page_loaded")
+
+    # ── Step 2: click "Add now" / "Add recovery phone" / "Add phone" if shown ──
+    # On the /phone page, the button is usually "Add now". On other variants
+    # it might be "Add recovery phone" or "Add a phone number".
+    log.info("Looking for Add-phone CTA button")
+    cta_clicked = False
+    for sel in [
+        'button:has-text("Add now")',
+        '[role="button"]:has-text("Add now")',
+        'button:has-text("Add recovery phone")',
+        'button:has-text("Add a phone number")',
+        'button:has-text("Add phone number")',
+        'button:has-text("Add phone")',
+        '[role="button"]:has-text("Add recovery phone")',
+        '[role="button"]:has-text("Add phone number")',
+        '[role="button"]:has-text("Add a phone number")',
+        'a:has-text("Add now")',
+        'a:has-text("Add recovery phone")',
+        'a:has-text("Add a phone number")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                cta_clicked = True
+                log.info("Clicked CTA via: %s", sel)
+                await _hd(2.5, 4)
+                break
+        except Exception:
+            continue
+    if not cta_clicked:
+        # Text-search fallback
+        if await _click_text(page, [
+            "add now", "add recovery phone", "add a phone number",
+            "add phone number", "إضافة الآن", "أضف الآن",
+        ], 4000):
+            cta_clicked = True
+            log.info("Clicked CTA via text search")
+            await _hd(2.5, 4)
+    await _snap("2_after_cta")
+
+    # ── Step 3: wait for the phone input field (across frames + with retries) ──
+    # After clicking "Add now", Google may:
+    #   (a) navigate to a new page,
+    #   (b) load the input inline in the same page,
+    #   (c) load it inside an iframe,
+    #   (d) require a re-auth password challenge first.
+    # We handle all four cases with patience and frame-traversal.
+    phone_sel = (
+        'input[type="tel"], input[name="phoneNumber"], '
+        'input[aria-label*="phone" i], input[autocomplete="tel"]'
+    )
+
+    async def _find_phone_input_anywhere():
+        """Search the main page AND every iframe for the phone input."""
+        # Main page first
+        try:
+            loc = page.locator(phone_sel).first
+            if await loc.count() and await loc.is_visible():
+                return loc, page
+        except Exception:
+            pass
+        # All frames
+        try:
+            for fr in page.frames:
+                try:
+                    fl = fr.locator(phone_sel).first
+                    if await fl.count() and await fl.is_visible():
+                        log.info("Found phone input inside frame: %s", fr.url)
+                        return fl, fr
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+
+    async def _maybe_handle_reauth():
+        """If Google shows a password re-auth prompt, fill it (best-effort)."""
+        try:
+            pwd_loc = page.locator(
+                'input[type="password"]:not([name="hiddenPassword"])'
+                ':not([aria-hidden="true"]):not([tabindex="-1"])'
+            ).first
+            if await pwd_loc.count() and await pwd_loc.is_visible():
+                log.info("Re-auth prompt detected on phone page")
+                # We don't have the password here, so just press Enter to skip
+                # (the caller's _reauth_if_needed should have handled it before)
+                return True
+        except Exception:
+            pass
+        return False
+
+    log.info("Waiting for phone input field (with frame search + retries)")
+    found_loc = None
+    found_frame = None
+    deadline = time.time() + 25.0
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        # Check for re-auth challenge
+        if await _maybe_handle_reauth():
+            log.warning("Phone page requires re-auth — bailing out")
+            await _snap("3_reauth_required")
+            return False
+        # Search main + frames
+        loc, frame = await _find_phone_input_anywhere()
+        if loc is not None:
+            found_loc = loc
+            found_frame = frame
+            log.info("Phone input found on attempt %d", attempts)
+            break
+        # Wait a bit and retry
+        await asyncio.sleep(1.0)
+        # On 4th attempt, try alternative URL
+        if attempts == 4:
+            log.info("Trying alternative URL: /signinoptions/rescuephone")
+            try:
+                await page.goto(
+                    "https://myaccount.google.com/signinoptions/rescuephone?hl=en",
+                    wait_until="domcontentloaded", timeout=15_000,
+                )
+                await _hd(2, 3)
+            except Exception as exc:
+                log.warning("Alternative URL failed: %s", exc)
+        # On 7th attempt, try clicking any button containing "phone" again
+        if attempts == 7:
+            log.info("Last resort: clicking any phone-related button")
+            try:
+                if await _click_text(page, [
+                    "add now", "add a phone", "add phone",
+                    "edit", "تعديل", "إضافة",
+                ], 3000):
+                    await _hd(2, 3)
+            except Exception:
+                pass
+
+    if found_loc is None:
+        log.warning("Phone input field not visible after %d attempts (25s)", attempts)
+        await _snap("3_FAILED_no_input")
+        try:
+            log.info("Current URL: %s", page.url)
+            log.info("Page title: %s", await page.title())
+        except Exception:
+            pass
+        return False
+
+    await _snap("3_input_visible")
+
+    # ── Step 4: select country (Iraq) from dropdown ──
+    country_iso = os.environ.get("PHONE_COUNTRY_ISO", "iq").lower().strip()
+    country_name = os.environ.get("PHONE_COUNTRY_NAME", "Iraq").strip()
+    country_dial = os.environ.get("PHONE_COUNTRY_DIAL", "+964").strip()
+
+    selected = False
+    try:
+        dropdown_selectors = [
+            'div[aria-label*="country" i][role="combobox"]',
+            'div[role="combobox"][aria-haspopup="listbox"]',
+            'button[aria-label*="country" i]',
+            'div[aria-label*="Country" i]',
+            '[role="combobox"]',
+        ]
+        for dsel in dropdown_selectors:
+            try:
+                dd = page.locator(dsel).first
+                if await dd.count() and await dd.is_visible():
+                    await dd.click(timeout=3000)
+                    await _hd(0.6, 1.2)
+                    log.info("Opened country dropdown via: %s", dsel)
+                    try:
+                        await page.keyboard.type(country_name, delay=80)
+                        await _hd(0.5, 1.0)
+                    except Exception:
+                        pass
+                    iraq_option_selectors = [
+                        f'[role="option"]:has-text("{country_name}")',
+                        f'li:has-text("{country_name}")',
+                        f'div[role="option"]:has-text("{country_dial}")',
+                        f'[role="option"]:has-text("{country_dial}")',
+                    ]
+                    for opt_sel in iraq_option_selectors:
+                        try:
+                            opt = page.locator(opt_sel).first
+                            if await opt.count() and await opt.is_visible():
+                                await opt.click(timeout=2500)
+                                selected = True
+                                log.info("Selected country '%s'", country_name)
+                                break
+                        except Exception:
+                            continue
+                    if not selected:
+                        try:
+                            await page.keyboard.press("Enter")
+                            selected = True
+                        except Exception:
+                            pass
+                    break
+            except Exception:
+                continue
+        if not selected:
+            log.info("Country dropdown not found — using international format")
+    except Exception as exc:
+        log.warning("Country selection failed (non-fatal): %s", exc)
+    await _snap("4_after_country")
+
+    await _hd(0.8, 1.5)
+
+    # ── Step 5: type the phone number ──
+    try:
+        await page.wait_for_selector(phone_sel, timeout=5_000, state="visible")
+    except Exception:
+        pass
+    phone_loc = page.locator(phone_sel).first
+    await phone_loc.click()
+    await _hd(0.3, 0.7)
+
+    raw = re.sub(r"\D", "", phone.strip())
+    if selected:
+        dial_digits = re.sub(r"\D", "", country_dial)
+        if dial_digits and raw.startswith(dial_digits):
+            local = raw[len(dial_digits):]
+        else:
+            local = raw
+        cleaned = local.lstrip("0") if local.startswith("0") else local
+        log.info("Country selected — typing local: %s", cleaned)
+    else:
+        cleaned = ("+" + raw) if not phone.strip().startswith("+") else "+" + raw
+        log.info("No country — typing international: %s", cleaned)
+
+    try:
+        await phone_loc.fill("")
+        await _hd(0.2, 0.4)
+    except Exception:
+        pass
+    await phone_loc.type(cleaned, delay=random.randint(40, 90))
+    await _hd(0.6, 1.2)
+    await _snap("5_after_typing")
+
+    # ── Step 6: submit ──
+    if not await _click_text(page, ["next", "send", "save", "التالي", "إرسال", "حفظ"], 4000):
+        await page.keyboard.press("Enter")
+    log.info("Submitted phone number")
+    await _hd(3, 5)
+    await _snap("6_after_submit")
+
+    # ── Step 7: handle SMS code if requested ──
+    code_input_sel = (
+        'input[type="tel"][maxlength="6"], '
+        'input[autocomplete="one-time-code"], '
+        'input[name="code"], input#code, input[name="Pin"], '
+        'input[aria-label*="code" i]'
+    )
+    code_field_visible = False
+    try:
+        await page.wait_for_selector(code_input_sel, timeout=8_000, state="visible")
+        code_field_visible = True
+    except Exception:
+        pass
+
+    if not code_field_visible:
+        log.info("Phone added without SMS verification")
+        return True
+
+    log.info("Google is asking for an SMS verification code")
+    await _snap("7_sms_requested")
+
+    if sms_code_provider is None:
+        log.warning("No SMS provider configured — aborting")
+        return False
+
+    try:
+        code = await sms_code_provider()
+    except Exception as exc:
+        log.warning("SMS code provider raised: %s", exc)
+        return False
+    if not code or not str(code).strip():
+        return False
+
+    code = re.sub(r"\D", "", str(code).strip())
+    if not code:
+        return False
+
+    log.info("Entering SMS code")
+    code_loc = page.locator(code_input_sel).first
+    await code_loc.click()
+    await _hd(0.3, 0.7)
+    await code_loc.type(code, delay=random.randint(40, 90))
+    await _hd(0.4, 0.9)
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي", "submit"], 4000):
+        await page.keyboard.press("Enter")
+    await _hd(2.5, 4)
+    await _snap("7_after_code")
+    return True
+
+
+async def _setup_new_authenticator(
+    page,
+    on_progress: ProgressCallback,
+    current_password: str,
+    sms_code_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    *,
+    on_screenshot: Optional[ScreenshotCallback] = None,
+    user_id: int = 0,
+    old_password: str = "",
+    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
+    on_credentials_ready: Optional[CredentialsCallback] = None,
+) -> str:
+    async def _snap(tag: str) -> None:
+        await _shoot(page, user_id, tag, on_screenshot)
+
+    password_candidates = [p for p in [current_password, old_password] if p]
+
+    await on_progress("step:open_2fa_settings")
+    await page.goto(
+        "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
+        wait_until="domcontentloaded",
+    )
+    await _hd(2, 3.5)
+    await _snap("2sv_page_loaded")
+
+    # Re-auth may be required to open the 2SV settings page itself
+    await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
+    await _hd(1.5, 2.5)
+
+    # Default phone is hard-coded but can be overridden via env var.
+    # Use international format (+964...) for Iraqi numbers — Google requires it.
+    phone_to_add = os.environ.get("FALLBACK_PHONE", "+9647728257333").strip()
+
+    # Step 1: If 2SV is currently OFF, try to turn it on
+    async def _read_body() -> str:
+        try:
+            return (await page.inner_text("body")).lower()
+        except Exception:
+            return ""
+
+    body = await _read_body()
+    needs_turn_on = any(kw in body for kw in [
+        "turn on 2-step verification", "turn on 2-step", "تفعيل التحقّق",
+        "تفعيل المصادقة الثنائية", "تفعيل التحقق",
+    ])
+
+    # Detect if a phone number is already on the account. If "Add a phone number"
+    # is visible in the Second steps section, the account has none.
+    phone_already_set = True
+    try:
+        if "add a phone number" in body or "إضافة رقم هاتف" in body:
+            phone_already_set = False
+    except Exception:
+        pass
+    log.info("State: needs_turn_on=%s phone_already_set=%s", needs_turn_on, phone_already_set)
+
+    # ── PROACTIVE: add phone FIRST (before clicking Turn on 2SV) ──
+    # This avoids the "Add second steps to your account" dialog entirely on
+    # accounts that have only a passkey. We add the phone as a second step
+    # while 2SV is still off, then turn 2SV on cleanly.
+    if needs_turn_on and not phone_already_set and phone_to_add:
+        log.info("Adding phone number proactively BEFORE turning on 2SV")
+        await on_progress("step:add_phone_number")
+        try:
+            added = await _add_phone_number(
+                page, phone_to_add, sms_code_provider,
+                on_screenshot=on_screenshot, user_id=user_id,
+            )
+            await _snap("after_proactive_add_phone")
+            if added:
+                # Reload 2SV page to refresh state
+                await _hd(2, 3)
+                try:
+                    await page.goto(
+                        "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
+                        wait_until="domcontentloaded",
+                    )
+                    await _hd(2, 3.5)
+                    await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
+                    await _hd(1.5, 2.5)
+                    await _snap("2sv_page_after_phone")
+                except Exception as exc:
+                    log.warning("Could not reload 2SV page after phone add: %s", exc)
+            else:
+                log.warning("Proactive phone add did not succeed — will try fallback path")
+        except Exception as exc:
+            log.warning("Proactive phone add raised: %s — continuing", exc)
+
+    if needs_turn_on:
+        log.info("Clicking 'Turn on 2-Step Verification'")
+        if await _click_turn_on_2sv(page):
+            await _hd(2, 3.5)
+            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
+            await _hd(1.5, 2.5)
+            await _snap("after_click_turn_on_2sv")
+
+            # FALLBACK: if the dialog still appears (phone add failed earlier
+            # or for any other reason), detect and handle it as before.
+            needs_phone = False
+            for attempt in range(3):
+                body = await _read_body()
+                if any(kw in body for kw in [
+                    "add second steps", "add another one or add another second step",
+                    "doesn't sync across your devices", "first add second steps",
+                    "إضافة طرق تحقق", "أضف خطوات تحقق",
+                ]):
+                    needs_phone = True
+                    log.info("Detected 'Add second steps' dialog (body match)")
+                    break
+                try:
+                    html = (await page.content()).lower()
+                    if any(kw in html for kw in [
+                        "add second steps", "first add second steps",
+                        "doesn't sync across your devices",
+                    ]):
+                        needs_phone = True
+                        log.info("Detected 'Add second steps' dialog (html match)")
+                        break
+                except Exception:
+                    pass
+                try:
+                    go_back = page.locator(
+                        '[role="dialog"] button:has-text("Go back"), '
+                        '[role="alertdialog"] button:has-text("Go back"), '
+                        'div[aria-modal="true"] button:has-text("Go back")'
+                    ).first
+                    if await go_back.count() and await go_back.is_visible():
+                        needs_phone = True
+                        log.info("Detected 'Add second steps' dialog (Go back button)")
+                        break
+                except Exception:
+                    pass
+                if "two-step-verification" in page.url and attempt > 0:
+                    log.info("Still on 2SV page after click — assuming phone needed")
+                    needs_phone = True
+                    break
+                await _hd(1.5, 2.5)
+
+            if needs_phone:
+                log.info("Fallback: dialog appeared, adding phone now")
+                await _snap("dialog_add_second_steps")
+                await _click_text(page, ["go back", "العودة", "رجوع", "back"], 3000)
+                await _hd(1.5, 2.5)
+
+                if phone_to_add:
+                    await on_progress("step:add_phone_number")
+                    added = await _add_phone_number(
+                        page, phone_to_add, sms_code_provider,
+                        on_screenshot=on_screenshot, user_id=user_id,
+                    )
+                    await _snap("after_add_phone_number")
+                    if added:
+                        await _hd(2, 3)
+                        try:
+                            await page.goto(
+                                "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
+                                wait_until="domcontentloaded",
+                            )
+                            await _hd(2, 3.5)
+                            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
+                            await _hd(1.5, 2.5)
+                        except Exception as exc:
+                            log.warning("Could not reload 2SV page: %s", exc)
+                        if await _click_turn_on_2sv(page):
+                            await _hd(2, 3.5)
+                            await _reauth_if_needed(page, [current_password, old_password] if old_password else current_password, on_password_used=on_password_used)
+                            await _hd(1.5, 2.5)
+                            await _snap("after_2sv_retry")
+                else:
+                    raise RuntimeError(
+                        "Google يطلب إضافة رقم هاتف لتفعيل 2SV. "
+                        "أضف متغير البيئة FALLBACK_PHONE برقم الهاتف وأعد المحاولة."
+                    )
+
+            # Skip any leftover wizard prompts
+            for label in [
+                "skip", "تخطي", "not now", "ليس الآن", "later", "لاحقاً",
+                "use another method", "use a different method",
+            ]:
+                if await _click_text(page, [label], 1500):
+                    await _hd(0.6, 1.2)
+        else:
+            log.warning("Could not find 'Turn on 2-Step Verification' button")
+
+    await on_progress("step:enable_new_authenticator")
+    await _snap("before_authenticator_setup")
+
+    # Step 2: Open the Authenticator section
+    await _click_text(page, [
+        "authenticator app", "authenticator", "add authenticator app",
+        "تطبيق المصادقة", "إضافة تطبيق المصادقة",
+    ], 5000)
+    await _hd(1.5, 2.5)
+
+    # Step 3: Click "Set up authenticator" / "Get started" / "+ Add"
+    await _click_text(page, [
+        "set up authenticator", "set up", "+ add authenticator",
+        "get started", "إعداد", "بدء", "إضافة",
+    ], 5000)
+    await _hd(1.5, 2.5)
+
+    # Step 4: Reveal the secret key (instead of scanning QR)
+    revealed = await _click_text(page, [
+        "can't scan it", "can’t scan it", "can't scan", "cannot scan",
+        "لا يمكنك المسح", "show secret", "show key",
+        "set up without a qr code", "without a qr",
+    ], 5000)
+    await _hd(1.0, 2.0)
+
+    secret = ""
+    if revealed:
+        try:
+            html = await page.content()
+            m = re.search(r"\b([A-Z2-7]{4}\s?[A-Z2-7]{4}\s?[A-Z2-7]{4}\s?[A-Z2-7]{4}[A-Z2-7\s]*)\b", html)
+            if m:
+                secret = m.group(1).replace(" ", "").upper()
+        except Exception:
+            pass
+    if not secret:
+        # Fallback: try reading any visible text element that looks like a base32 chunk
+        try:
+            chunks = await page.locator("xpath=//*[contains(text(),' ')]").all_text_contents()
+            for c in chunks:
+                m = re.search(r"\b([A-Z2-7]{4}\s[A-Z2-7]{4}(?:\s[A-Z2-7]{4}){2,})\b", c.upper())
+                if m:
+                    secret = m.group(1).replace(" ", "").upper()
+                    break
+        except Exception:
+            pass
+
+    if not secret:
+        raise RuntimeError("تعذّر استخراج مفتاح Authenticator الجديد من Google")
+
+    log.info("Extracted new TOTP secret (len=%d)", len(secret))
+    await _snap("totp_secret_extracted")
+
+    # ── إرسال المفتاح + الرابط + الرمز للمستخدم فوراً ──
+    tfa_url = f"https://2fa.fb.tools/{secret}"
+    if on_credentials_ready is not None:
+        for label, value in (
+            ("new_totp_secret", secret),
+            ("totp_url", tfa_url),
+        ):
+            try:
+                await on_credentials_ready(label, value)
+            except Exception as exc:
+                log.warning("emit %s failed: %s", label, exc)
+        try:
+            current_code = _now_totp(secret)
+            await on_credentials_ready("totp_code", current_code)
+        except Exception as exc:
+            log.warning("emit totp_code failed: %s", exc)
+
+
+    # ── Click "Next" to proceed from QR/secret page to the code-entry page ──
+    # The previous text-only search was too greedy and could click wrong buttons.
+    # Try specific button selectors first, then fall back to text search.
+    log.info("Clicking 'Next' to proceed to TOTP code entry")
+    next_clicked = False
+    for sel in [
+        'button:has-text("Next"):not(:has-text("Try"))',
+        '[role="button"]:has-text("Next"):not(:has-text("Try"))',
+        'button[jsname]:has-text("Next")',
+        'button:has-text("التالي")',
+        '[role="button"]:has-text("التالي")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                await _hd(0.3, 0.7)
+                await loc.click(timeout=4000)
+                next_clicked = True
+                log.info("Clicked 'Next' on QR page via: %s", sel)
+                break
+        except Exception:
+            continue
+    if not next_clicked:
+        # Last resort: text search (but only for "next"/"التالي" — not "try")
+        next_clicked = await _click_text(page, ["next", "التالي"], 4000)
+    if not next_clicked:
+        log.warning("Could not find 'Next' button on QR page — pressing Enter")
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            pass
+    await _hd(2.0, 3.5)
+    await _snap("after_qr_next_click")
+
+    # ── Wait for TOTP code-entry field with retry ──
+    code = _now_totp(secret)
+    code_sel = (
+        'input[type="tel"], input#totpPin, input[name="totpPin"], '
+        'input[autocomplete="one-time-code"]'
+    )
+    code_field_found = False
+    for attempt in range(3):
+        try:
+            await _reauth_if_needed(page, password_candidates, timeout_ms=6_000, on_password_used=on_password_used)
+            await page.wait_for_selector(code_sel, timeout=10_000, state="visible")
+            code_field_found = True
+            log.info("TOTP code field appeared (attempt %d)", attempt + 1)
+            break
+        except Exception:
+            log.warning("TOTP code field not visible (attempt %d/3)", attempt + 1)
+            await _snap(f"totp_field_missing_attempt{attempt + 1}")
+            try:
+                body_now = (await page.inner_text("body")).lower()
+            except Exception:
+                body_now = ""
+            if _looks_like_password_challenge(body_now, page.url):
+                log.info("Authenticator flow hit password challenge on attempt %d", attempt + 1)
+                reauthed = await _reauth_if_needed(
+                    page,
+                    password_candidates,
+                    timeout_ms=15_000,
+                    on_password_used=on_password_used,
+                )
+                await _hd(1.5, 2.5)
+                if reauthed:
+                    try:
+                        await page.wait_for_selector(code_sel, timeout=8_000, state="visible")
+                        code_field_found = True
+                        log.info("TOTP code field appeared after password recovery")
+                        break
+                    except Exception:
+                        log.info("Password recovery succeeded but TOTP input still not visible yet")
+            # Retry: maybe Next wasn't actually clicked — try again
+            if attempt < 2:
+                if await _click_text(page, ["next", "التالي"], 3000):
+                    log.info("Re-clicked 'Next' on retry %d", attempt + 1)
+                else:
+                    try:
+                        await page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                await _hd(2.0, 3.0)
+
+    if not code_field_found:
+        try:
+            log.warning("TOTP page never appeared. URL=%s, title=%s",
+                        page.url, await page.title())
+        except Exception:
+            pass
+        await _snap("totp_field_FAILED_but_secret_emitted")
+        log.warning("Returning secret as partial success (user has secret/url/code)")
+        return secret
+
+    # إدخال الرمز في Google — مع إعادة توليد كود طازج
+    try:
+        try:
+            code = _now_totp(secret)
+        except Exception:
+            pass
+        await _type_human_at(page, code_sel, code)
+        await _hd(0.5, 1.2)
+        if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 4000):
+            await page.keyboard.press("Enter")
+        await _hd(3, 5)
+        await _snap("totp_code_submitted")
+
+        # تأكيد التفعيل النهائي: Done / Turn on / تفعيل
+        for label in [
+            "done", "turn on", "save", "finish", "got it",
+            "تم", "تفعيل", "حفظ", "إنهاء", "موافق",
+        ]:
+            if await _click_text(page, [label], 2500):
+                await _hd(1.0, 2.0)
+                break
+        await _snap("after_2sv_finalized")
+        log.info("2FA finalized successfully")
+    except Exception as exc:
+        log.warning("TOTP submit/finalize failed (non-fatal): %s", exc)
+        await _snap("totp_submit_failed_nonfatal")
+    return secret
+
+
+async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
+                          on_progress: ProgressCallback, old_password: str = "") -> bool:
+    """Sign out, sign back in with the new credentials, and confirm 2FA works
+    without any user interaction. Handles passkey/device-tap automatically."""
+    await on_progress("step:verify_new_2fa")
+    try:
+        await page.goto("https://accounts.google.com/Logout",
+                        wait_until="domcontentloaded", timeout=20_000)
+        await _hd(2, 3)
+    except Exception:
+        pass
+
+    await page.goto("https://accounts.google.com/signin/v2/identifier?hl=en",
+                    wait_until="domcontentloaded")
+    await _hd(1.5, 2.5)
+
+    email_loc = await _wait_for_visible_locator(
+        page, ['input[type="email"]', 'input#identifierId'], timeout_ms=20_000,
+    )
+    await email_loc.click()
+    await _hd(0.3, 0.8)
+    await email_loc.type(gmail, delay=random.randint(40, 120))
+    next_btn = page.locator("#identifierNext").first
+    if await next_btn.count() == 0:
+        next_btn = page.get_by_role("button", name="Next")
+    if await next_btn.count() > 0:
+        await next_btn.click()
+    else:
+        await page.keyboard.press("Enter")
+    await _hd(2, 3)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
+
+    # After email, Google may go directly to passkey / 2FA without showing a
+    # password field (if account is passwordless). Check first.
+    code_sel = (
+        'input[type="tel"], input#totpPin, input[name="totpPin"], '
+        'input[autocomplete="one-time-code"]'
+    )
+
+    password_candidates = [p for p in [new_password, old_password] if p]
+
+    # Try password field first (normal flow)
+    try:
+        pwd_loc = await _wait_for_visible_locator(
+            page,
+            [
+                'input[type="password"][name="Passwd"]',
+                'input[type="password"]:not([name="hiddenPassword"]):not([aria-hidden="true"]):not([tabindex="-1"])',
+                'input[type="password"]',
+            ],
+            timeout_ms=10_000,
+        )
+        del pwd_loc
+        await _reauth_if_needed(page, password_candidates, timeout_ms=15_000)
+        await _hd(2.5, 4)
+    except Exception:
+        # No password field — Google may have jumped straight to passkey/2FA
+        log.info("No password field shown — proceeding to 2FA detection")
+
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if _looks_like_password_challenge(body, page.url):
+        await _reauth_if_needed(page, password_candidates, timeout_ms=15_000)
+        await _hd(1.5, 2.5)
+
+    # Now handle whatever 2FA challenge appears: passkey, device-tap, or TOTP
+    # _switch_to_totp_method handles passkey + device-tap + try-another-way
+    await _switch_to_totp_method(page)
+
+    # Wait for TOTP input field
+    try:
+        await page.wait_for_selector(code_sel, timeout=20_000, state="visible")
+    except Exception:
+        # One more retry: maybe still on passkey screen
+        if await _switch_to_totp_method(page):
+            try:
+                await page.wait_for_selector(code_sel, timeout=15_000, state="visible")
+            except Exception:
+                # If we can't find TOTP input but URL says we're logged in, treat as success
+                cur = page.url
+                if "myaccount" in cur or ("signin" not in cur and "challenge" not in cur):
+                    log.info("Verify: no TOTP shown but URL looks logged-in (%s)", cur)
+                    return True
+                raise RuntimeError("لم يظهر حقل إدخال رمز Authenticator في التحقق")
+        else:
+            cur = page.url
+            if "myaccount" in cur or ("signin" not in cur and "challenge" not in cur):
+                return True
+            raise RuntimeError("لم يظهر حقل إدخال رمز Authenticator في التحقق")
+
+    # Auto-enter the TOTP code using the new secret
+    code = _now_totp(new_secret)
+    log.info("Auto-entering fresh TOTP code from new secret")
+    await _type_human_at(page, code_sel, code)
+    await _hd(0.4, 0.9)
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 3000):
+        await page.keyboard.press("Enter")
+    await _hd(3, 5)
+
+    # Skip "Stay signed in" / "save device" prompts so we land on myaccount
+    for label in ["not now", "ليس الآن", "skip", "تخطي"]:
+        if await _click_text(page, [label], 1500):
+            await _hd(0.6, 1.2)
+            break
+
+    cur = page.url
+    success = "myaccount" in cur or ("signin" not in cur and "challenge" not in cur)
+    log.info("Verify result: success=%s url=%s", success, cur)
+    return success
+
+
 # ---------------------------------------------------------------------------
-# Browser engines logic (Full Definition Maintained)
-# ---------------------------------------------------------------------------
-
-async def _launch_camoufox() -> Optional[Tuple[Any, Any, Any, Any]]:
-    try:
-        from camoufox.async_api import AsyncCamoufox
-    except ImportError: return None
-    proxy_cfg = _build_proxy_cfg()
-    kwargs = {"headless": True, "humanize": True, "i_know_what_im_doing": True}
-    if proxy_cfg: kwargs["proxy"] = proxy_cfg
-    try:
-        cm = AsyncCamoufox(**kwargs)
-        browser = await cm.__aenter__()
-        ctx = await browser.new_context()
-        await ctx.add_init_script(_EXTRA_STEALTH_JS)
-        page = await ctx.new_page()
-        async def _cleanup():
-            try: await page.close()
-            except: pass
-            try: await ctx.close()
-            except: pass
-            try: await cm.__aexit__(None, None, None)
-            except: pass
-        return _cleanup, browser, ctx, page
-    except: return None
-
-async def _launch_patchright() -> Optional[Tuple[Any, Any, Any, Any]]:
-    try:
-        from patchright.async_api import async_playwright as patchright_pw
-    except ImportError: return None
-    proxy_cfg = _build_proxy_cfg()
-    try:
-        pw_inst = await patchright_pw().start()
-        kwargs = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
-        if proxy_cfg: kwargs["proxy"] = proxy_cfg
-        browser = await pw_inst.chromium.launch(**kwargs)
-        ctx = await browser.new_context(user_agent=random.choice(_STEALTH_UAS))
-        await ctx.add_init_script(_EXTRA_STEALTH_JS)
-        page = await ctx.new_page()
-        async def _cleanup():
-            try: await page.close()
-            except: pass
-            try: await browser.close()
-            except: pass
-            try: await pw_inst.stop()
-            except: pass
-        return _cleanup, browser, ctx, page
-    except: return None
-
-async def _launch_playwright(pw) -> Tuple[Any, Any, Any, Any]:
-    proxy_cfg = _build_proxy_cfg()
-    kwargs = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
-    if proxy_cfg: kwargs["proxy"] = proxy_cfg
-    browser = await pw.chromium.launch(**kwargs)
-    ctx = await browser.new_context(user_agent=random.choice(_STEALTH_UAS))
-    await ctx.add_init_script(_EXTRA_STEALTH_JS)
-    page = await ctx.new_page()
-    async def _cleanup():
-        try: await page.close()
-        except: pass
-        try: await browser.close()
-        except: pass
-    return _cleanup, browser, ctx, page
-
-def _build_proxy_cfg() -> Optional[Dict[str, str]]:
-    proxy_url = os.environ.get("PROXY_URL", "").strip()
-    if not proxy_url: return None
-    u = urlparse(proxy_url)
-    cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
-    if u.username: cfg["username"] = u.username
-    if u.password: cfg["password"] = u.password
-    return cfg
-
-# ---------------------------------------------------------------------------
-# Public Entry Point
+# Public entry point
 # ---------------------------------------------------------------------------
 
 async def rotate_google_account(
@@ -1281,78 +2202,210 @@ async def rotate_google_account(
     on_credentials_ready: Optional[CredentialsCallback] = None,
     custom_new_password: str = "",
 ) -> Dict[str, Any]:
-    
+    """Rotate a Google account's password and 2FA secret.
+
+    Args:
+        on_progress: async callback receiving status strings.
+        gmail: account email.
+        old_password: current password.
+        old_totp_secret: current TOTP secret (base32) or empty.
+        user_id: telegram user id (for screenshot filenames).
+        sms_code_provider: optional async callable that returns an SMS code
+            string. The bot's main handler should pass a function that:
+              1. Sends a Telegram notification asking the user for the code
+              2. Waits for the user's reply
+              3. Returns the code
+            If Google never asks for an SMS code, this is never called.
+        on_screenshot: optional callback called after every major step with
+            (step_name, screenshot_path). Use it to forward screenshots to
+            the user via Telegram so they can debug visually.
+        on_credentials_ready: optional callback called as soon as a new
+            credential is available, with (label, value). Examples:
+                ("new_password", "VJ77X2305xx30j5")
+                ("new_totp_secret", "JBSWY3DPEHPK3PXP")
+            This lets the bot send the new password to the user IMMEDIATELY
+            after it's set, so even if a later step fails, the user has
+            their password already.
+    """
     result: Dict[str, Any] = {
-        "success": False, "gmail": gmail, "old_password": old_password,
-        "new_password": None, "new_totp_secret": None, "step": "launch_browser",
-        "error": None, "screenshot_path": None, "html_path": None
+        "success": False,
+        "gmail": gmail,
+        "new_password": None,
+        "new_totp_secret": None,
+        "password_used_for_reauth": None,
+        "step": "launch_browser",
+        "error": None,
+        "screenshot_path": None,
+        "html_path": None,
+        "problem_txt_path": None,
+        "solution_txt_path": None,
     }
+
+    if not gmail or "@" not in gmail:
+        result["error"] = "إيميل غير صالح"
+        return result
+    if not old_password:
+        result["error"] = "كلمة السر القديمة مطلوبة"
+        return result
+    if old_totp_secret:
+        try:
+            pyotp.TOTP(old_totp_secret.replace(" ", "").upper()).now()
+        except Exception as exc:
+            result["error"] = f"مفتاح 2FA القديم غير صالح: {exc}"
+            return result
+
+    current_step = "launch_browser"
+
+    async def _progress_wrap(s: str) -> None:
+        nonlocal current_step
+        if s.startswith("step:"):
+            current_step = s.split(":", 1)[1]
+        try:
+            await on_progress(_format_progress(current_step))
+        except Exception:
+            pass
 
     cleanup = browser = ctx = page = None
     pw_cm = pw = None
 
+    async def _emit_credential(label: str, value: str) -> None:
+        """Notify the caller as soon as a credential is ready."""
+        if on_credentials_ready is None or not value:
+            return
+        try:
+            await on_credentials_ready(label, value)
+        except Exception as exc:
+            log.warning("on_credentials_ready callback failed: %s", exc)
+
     try:
-        await on_progress("🔧 تشغيل المتصفح...")
-        # Multi-engine launch
+        await _progress_wrap("step:launch_browser")
+
+        # 1) Try Camoufox (best anti-detection)
         result_launch = await _launch_camoufox()
-        if not result_launch: result_launch = await _launch_patchright()
+        engine = "camoufox"
         if not result_launch:
-            from playwright.async_api import async_playwright
+            # 2) Try Patchright
+            result_launch = await _launch_patchright()
+            engine = "patchright"
+        if not result_launch:
+            # 3) Fallback to Playwright Chromium
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                result["error"] = "لا توجد متصفحات مثبتة (Camoufox/Patchright/Playwright)"
+                return result
             pw_cm = async_playwright()
             pw = await pw_cm.__aenter__()
             result_launch = await _launch_playwright(pw)
+            engine = "playwright"
 
         cleanup, browser, ctx, page = result_launch
+        log.info("Browser engine: %s", engine)
+
         page_holder = {"page": page, "ctx": ctx}
+        await _do_login(page_holder, gmail, old_password, old_totp_secret, _progress_wrap)
+        page = page_holder["page"]  # may have been swapped
+        await _shoot(page, user_id, "after_login", on_screenshot)
 
-        # 1. Login
-        await _do_login(page_holder, gmail, old_password, old_totp_secret, on_progress)
-        page = page_holder["page"]
-
-        # 2. Change password
-        new_password = await _change_password(page, on_progress, old_password, custom_new_password)
+        new_password = await _change_password(
+            page, _progress_wrap, old_password,
+            custom_new_password=custom_new_password,
+        )
         result["new_password"] = new_password
-        if on_credentials_ready: await on_credentials_ready("new_password", new_password)
+        await _emit_credential("new_password", new_password)
+        await _shoot(page, user_id, "after_change_password", on_screenshot)
 
-        # 3. Setup 2FA (FIXED FLOW)
+        async def _notify_password_used(pwd_used: str) -> None:
+            label = "new_password" if pwd_used == new_password else "old_password_still_active"
+            log.info("Password actually used during reauth: %s", label)
+            result["password_used_for_reauth"] = pwd_used
+            if on_credentials_ready is not None:
+                try:
+                    await on_credentials_ready("password_used_for_reauth", pwd_used)
+                except Exception as exc:
+                    log.warning("on_credentials_ready callback failed: %s", exc)
+
         new_secret = await _setup_new_authenticator(
-            page, on_progress, new_password, sms_code_provider,
+            page, _progress_wrap, new_password, sms_code_provider,
             on_screenshot=on_screenshot, user_id=user_id,
             old_password=old_password,
-            on_credentials_ready=on_credentials_ready
+            on_password_used=_notify_password_used,
+            on_credentials_ready=on_credentials_ready,
         )
-        
         result["new_totp_secret"] = new_secret
+        result["totp_url"] = f"https://2fa.fb.tools/{new_secret}"
+        try:
+            result["totp_code"] = _now_totp(new_secret)
+        except Exception:
+            result["totp_code"] = None
+        await _emit_credential("new_totp_secret", new_secret)
+        await _emit_credential("totp_url", result["totp_url"])
+        if result.get("totp_code"):
+            await _emit_credential("totp_code", result["totp_code"])
+        await _shoot(page, user_id, "after_setup_2fa", on_screenshot)
+
+        # verify غير قاتل
+        try:
+            await _verify_new_2fa(page, gmail, new_password, new_secret, _progress_wrap, old_password)
+            await _shoot(page, user_id, "after_verify", on_screenshot)
+        except Exception as exc:
+            log.warning("verify_new_2fa failed (non-fatal): %s", exc)
+            await _shoot(page, user_id, "verify_failed_nonfatal", on_screenshot)
+
+        await _progress_wrap("step:done")
         result["success"] = True
         result["step"] = "done"
-        await on_progress("مكتمل ✅")
         return result
 
     except Exception as exc:
-        log.exception("Rotation failed at step=%s", result["step"])
-        result["error"] = str(exc)
+        log.exception("rotate_google_account failed at step=%s", current_step)
+        result["step"] = current_step
+        result["error"] = str(exc) or exc.__class__.__name__
+        if page is not None:
+            cap = await _capture(page, user_id, current_step)
+            result["screenshot_path"] = cap["screenshot_path"]
+            result["html_path"] = cap["html_path"]
+            txts = await _write_admin_debug_reports(
+                page,
+                user_id=user_id,
+                step=current_step,
+                error_text=result["error"],
+                screenshot_path=result.get("screenshot_path"),
+                html_path=result.get("html_path"),
+                old_password=old_password,
+                new_password=result.get("new_password") or "",
+                password_used_for_reauth=result.get("password_used_for_reauth") or "",
+            )
+            result["problem_txt_path"] = txts.get("problem_txt_path")
+            result["solution_txt_path"] = txts.get("solution_txt_path")
+            # Also push the failure screenshot via the live callback
+            if cap.get("screenshot_path") and on_screenshot is not None:
+                try:
+                    await on_screenshot(f"error_{current_step}", cap["screenshot_path"])
+                except Exception:
+                    pass
         return result
+
     finally:
-        if cleanup: await cleanup()
-        if pw_cm: await pw_cm.__aexit__(None, None, None)
+        if cleanup:
+            try:
+                await cleanup()
+            except Exception:
+                pass
+        if pw_cm:
+            try:
+                await pw_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
-async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
-                          on_progress: ProgressCallback, old_password: str = "") -> bool:
-    await on_progress("step:verify_new_2fa")
-    # Sign out then sign in
-    await page.goto("https://accounts.google.com/Logout")
-    await _hd(2, 3)
-    await page.goto("https://accounts.google.com/signin")
-    await page.locator('input[type="email"]').fill(gmail)
-    await page.keyboard.press("Enter")
-    await _hd(2, 3)
-    await _reauth_if_needed(page, new_password)
-    await _switch_to_totp_method(page)
-    code_sel = 'input[type="tel"], input#totpPin'
-    await page.wait_for_selector(code_sel)
-    await page.locator(code_sel).type(_now_totp(new_secret))
-    await page.keyboard.press("Enter")
-    await _hd(4, 5)
-    return "myaccount" in page.url
 
-# Maintain original file footer
+def _format_progress(step: str) -> str:
+    label = STEP_LABELS_AR.get(step, step)
+    try:
+        idx = ROTATION_STEPS.index(step) + 1
+    except ValueError:
+        idx = 0
+    bar = ""
+    for i, _ in enumerate(ROTATION_STEPS, 1):
+        bar += "🟢" if i <= idx else "⚪️"
+    return f"{bar}\n\n🔧 الخطوة {idx}/{len(ROTATION_STEPS)}: *{label}*"
